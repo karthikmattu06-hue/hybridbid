@@ -1,48 +1,47 @@
 """
 Canonical schema definitions for HybridBid data tables.
 
-All data is stored in Parquet format with these schemas.
-The canonical timestamp is UTC at 5-minute intervals.
-Pre-RTC+B periods have NaN for RT AS price columns.
+All data is stored in Parquet format with UTC timestamps at 5-minute intervals.
+Column mappings are based on Phase 1/1b exploration of actual gridstatus output.
+
+Three canonical tables:
+  - energy_prices:      RT LMP + DAM SPP
+  - as_prices:          RT MCPCs (post-RTC+B) + DAM AS
+  - system_conditions:  load, wind, solar
 """
 
 import pyarrow as pa
+
+# RTC+B go-live boundary (UTC)
+RTCB_BOUNDARY_UTC = "2025-12-05T06:00:00"  # midnight CPT = 06:00 UTC
 
 # ──────────────────────────────────────────────
 # Energy Prices Table
 # ──────────────────────────────────────────────
 ENERGY_PRICES_SCHEMA = pa.schema([
-    ("timestamp", pa.timestamp("us", tz="UTC")),
-    # Real-time settlement point prices (15-min, resampled to 5-min via ffill)
-    ("rt_spp_hub", pa.float64()),           # Hub average SPP [$/MWh]
-    ("rt_spp_north", pa.float64()),         # North zone
-    ("rt_spp_south", pa.float64()),         # South zone
-    ("rt_spp_west", pa.float64()),          # West zone
-    ("rt_spp_houston", pa.float64()),       # Houston zone
-    # Day-ahead prices (hourly, resampled to 5-min via ffill)
-    ("dam_spp_hub", pa.float64()),          # DAM hub average [$/MWh]
-    # Metadata
-    ("is_post_rtcb", pa.bool_()),           # True if after Dec 5, 2025
+    ("timestamp_utc", pa.timestamp("us", tz="UTC")),
+    ("rt_lmp", pa.float64()),         # RT LMP at HB_HUBAVG [$/MWh], 5-min native
+    ("dam_spp", pa.float64()),        # DAM SPP at HB_HUBAVG [$/MWh], hourly ffill
+    ("is_post_rtcb", pa.bool_()),
 ])
 
 # ──────────────────────────────────────────────
 # Ancillary Service Prices Table
 # ──────────────────────────────────────────────
 AS_PRICES_SCHEMA = pa.schema([
-    ("timestamp", pa.timestamp("us", tz="UTC")),
-    # Real-time MCPCs (5-min, only exist post-RTC+B — NaN before Dec 5, 2025)
-    ("rt_mcpc_regup", pa.float64()),        # [$/MW]
-    ("rt_mcpc_regdown", pa.float64()),
+    ("timestamp_utc", pa.timestamp("us", tz="UTC")),
+    # RT MCPCs — 5-min SCED, NaN pre-RTC+B
+    ("rt_mcpc_regup", pa.float64()),   # [$/MW]
+    ("rt_mcpc_regdn", pa.float64()),
     ("rt_mcpc_rrs", pa.float64()),
     ("rt_mcpc_ecrs", pa.float64()),
     ("rt_mcpc_nsrs", pa.float64()),
-    # Day-ahead AS clearing prices (hourly, available full history)
-    ("dam_as_regup", pa.float64()),         # [$/MW]
-    ("dam_as_regdown", pa.float64()),
+    # DAM AS — hourly, forward-filled to 5-min
+    ("dam_as_regup", pa.float64()),    # [$/MW]
+    ("dam_as_regdn", pa.float64()),
     ("dam_as_rrs", pa.float64()),
-    ("dam_as_ecrs", pa.float64()),
+    ("dam_as_ecrs", pa.float64()),     # NaN → 0 pre-June 2023
     ("dam_as_nsrs", pa.float64()),
-    # Metadata
     ("is_post_rtcb", pa.bool_()),
 ])
 
@@ -50,33 +49,38 @@ AS_PRICES_SCHEMA = pa.schema([
 # System Conditions Table
 # ──────────────────────────────────────────────
 SYSTEM_CONDITIONS_SCHEMA = pa.schema([
-    ("timestamp", pa.timestamp("us", tz="UTC")),
-    # Load
-    ("total_load_mw", pa.float64()),        # System-wide load [MW]
-    ("load_forecast_mw", pa.float64()),     # 7-day ahead forecast [MW]
-    # Renewables — actuals
-    ("wind_actual_mw", pa.float64()),       # Wind generation [MW]
-    ("solar_actual_mw", pa.float64()),      # Solar generation [MW]
-    # Renewables — forecasts
-    ("wind_forecast_mw", pa.float64()),     # Wind forecast [MW]
-    ("solar_forecast_mw", pa.float64()),    # Solar forecast [MW]
-    # Derived
-    ("net_load_mw", pa.float64()),          # total_load - wind - solar [MW]
-    # Metadata
+    ("timestamp_utc", pa.timestamp("us", tz="UTC")),
+    ("total_load_mw", pa.float64()),       # ERCOT system total [MW]
+    ("load_forecast_mw", pa.float64()),    # Operational forecast [MW]
+    ("wind_actual_mw", pa.float64()),      # System-wide wind gen [MW]
+    ("wind_forecast_mw", pa.float64()),    # STWPF system-wide [MW]
+    ("solar_actual_mw", pa.float64()),     # System-wide solar gen [MW]
+    ("solar_forecast_mw", pa.float64()),   # STPPF system-wide [MW]
+    ("net_load_mw", pa.float64()),         # total_load - wind - solar [MW]
     ("is_post_rtcb", pa.bool_()),
 ])
 
 # ──────────────────────────────────────────────
-# Column name mappings from gridstatus to canonical
+# Column mappings: gridstatus → canonical
+# Based on Phase 1/1b exploration findings
 # ──────────────────────────────────────────────
-# These may need adjustment based on actual gridstatus output columns.
-# Update during Day 1 data exploration.
 
-GRIDSTATUS_COLUMN_MAP = {
-    # Energy prices — adjust after inspecting actual gridstatus output
-    "SPP": "rt_spp_hub",
-    "LMP": "rt_lmp_hub",
-    # Add mappings as discovered during exploration
+# DAM AS: gridstatus wide-format column names → canonical
+DAM_AS_COLUMN_MAP = {
+    "Regulation Up": "dam_as_regup",
+    "Regulation Down": "dam_as_regdn",
+    "Responsive Reserves": "dam_as_rrs",
+    "ERCOT Contingency Reserve Service": "dam_as_ecrs",
+    "Non-Spinning Reserves": "dam_as_nsrs",
+}
+
+# RT SCED MCPC: ASType values → canonical column names
+RT_MCPC_ASTYPE_MAP = {
+    "REGUP": "rt_mcpc_regup",
+    "REGDN": "rt_mcpc_regdn",
+    "RRS": "rt_mcpc_rrs",
+    "ECRS": "rt_mcpc_ecrs",
+    "NSPIN": "rt_mcpc_nsrs",
 }
 
 # ──────────────────────────────────────────────
@@ -84,15 +88,14 @@ GRIDSTATUS_COLUMN_MAP = {
 # ──────────────────────────────────────────────
 PARQUET_CONFIG = {
     "compression": "snappy",
-    "row_group_size": 100_000,    # ~1 week of 5-min data
+    "row_group_size": 100_000,
     "use_dictionary": True,
 }
 
-# Table names and their output paths (relative to data/processed/)
 TABLES = {
     "energy_prices": {
         "schema": ENERGY_PRICES_SCHEMA,
-        "partition_by": "month",  # YYYY-MM partitioning
+        "partition_by": "month",
         "path": "energy_prices",
     },
     "as_prices": {

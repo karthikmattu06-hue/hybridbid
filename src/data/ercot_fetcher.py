@@ -1,470 +1,366 @@
 """
-ERCOT data fetcher — wraps the gridstatus library.
+ERCOT data fetcher — confirmed access methods from Phase 1/1b exploration.
 
-Two ingestion paths:
-  Path A: gridstatus.ErcotAPI — for data from Dec 2023 onward (ERCOT REST API)
-  Path B: gridstatus.Ercot    — web scraping for historical data and real-time feeds
+Access methods per product (all confirmed working):
+  - RT LMP (5-min):    ErcotAPI.get_lmp_by_settlement_point()  — back to 2020
+  - DAM SPP (hourly):  Ercot.get_dam_spp(year=)                — back to 2020
+  - DAM AS (hourly):   ErcotAPI.get_as_prices()                 — back to 2020
+  - Load actual:       Ercot.get_hourly_load_post_settlements() — back to 2020
+  - Load forecast:     ErcotAPI.get_load_forecast_by_model()    — back to 2020
+  - Wind:              ErcotAPI.get_wind_actual_and_forecast_hourly() — back to 2020
+  - Solar:             ErcotAPI.get_solar_actual_and_forecast_hourly() — back to 2020
+  - RT SCED MCPC:      File loader (pre-downloaded Parquet in data/raw/sced_mcpc/)
 
-Both paths produce pandas DataFrames that are then cleaned and written
-to canonical Parquet schema by the preprocessing module.
+Credentials via environment variables:
+  ERCOT_API_USERNAME, ERCOT_API_PASSWORD, ERCOT_PUBLIC_API_SUBSCRIPTION_KEY
 """
 
 import logging
-from typing import Optional
+import os
+from pathlib import Path
 
 import pandas as pd
 
 logger = logging.getLogger(__name__)
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+DATA_RAW = PROJECT_ROOT / "data" / "raw"
 
-def _call_method_if_exists(obj, method_name: str, **kwargs):
-    """Call a method if present; return None when not available."""
-    if not hasattr(obj, method_name):
-        return None
-    method = getattr(obj, method_name)
-    return method(**kwargs)
-
-
-def _filter_by_datetime_window(
-    df: pd.DataFrame,
-    start: str,
-    end: str,
-    time_col_candidates: list[str] | None = None,
-) -> pd.DataFrame:
-    """Filter a DataFrame to [start, end) using index or common time columns."""
-    if df is None or df.empty:
-        return pd.DataFrame() if df is None else df
-
-    if time_col_candidates is None:
-        time_col_candidates = ["Time", "Interval Start", "SCED Timestamp", "Timestamp"]
-
-    out = df.copy()
-    ts_col = next((c for c in time_col_candidates if c in out.columns), None)
-
-    if ts_col is not None:
-        ts = pd.to_datetime(out[ts_col], utc=True, errors="coerce")
-        mask = (ts >= pd.Timestamp(start, tz="UTC")) & (ts < pd.Timestamp(end, tz="UTC"))
-        return out.loc[mask].copy()
-
-    if isinstance(out.index, pd.DatetimeIndex):
-        idx = out.index
-        if idx.tz is None:
-            idx = idx.tz_localize("UTC")
-        else:
-            idx = idx.tz_convert("UTC")
-        mask = (idx >= pd.Timestamp(start, tz="UTC")) & (idx < pd.Timestamp(end, tz="UTC"))
-        return out.loc[mask].copy()
-
-    return out
+# Singleton clients (lazy-initialized)
+_api_client = None
+_scraper_client = None
 
 
-def get_ercot_api():
-    """
-    Initialize gridstatus ErcotAPI client.
-    Requires ERCOT API credentials (free registration at apiexplorer.ercot.com).
-    """
+def _get_api():
+    """Get or create the ErcotAPI client (singleton)."""
+    global _api_client
+    if _api_client is not None:
+        return _api_client
+
     try:
-        # Older/newer gridstatus versions may expose ErcotAPI differently.
-        from gridstatus import ErcotAPI  # type: ignore
+        from gridstatus.ercot_api.ercot_api import ErcotAPI
     except ImportError:
+        raise ImportError("gridstatus>=0.35.0 required. Run: pip install gridstatus>=0.35.0")
+
+    _api_client = ErcotAPI(sleep_seconds=1.0, max_retries=5)
+    logger.info("ErcotAPI client initialized")
+    return _api_client
+
+
+def _get_scraper():
+    """Get or create the Ercot scraper client (singleton)."""
+    global _scraper_client
+    if _scraper_client is not None:
+        return _scraper_client
+
+    from gridstatus import Ercot
+    _scraper_client = Ercot()
+    logger.info("Ercot scraper client initialized")
+    return _scraper_client
+
+
+def _cache_path(product: str, date_str: str) -> Path:
+    """Path for a cached raw daily Parquet file."""
+    product_dir = DATA_RAW / product
+    product_dir.mkdir(parents=True, exist_ok=True)
+    return product_dir / f"{date_str}.parquet"
+
+
+def _load_cached(product: str, date_str: str) -> pd.DataFrame | None:
+    """Load cached raw file if it exists."""
+    path = _cache_path(product, date_str)
+    if path.exists():
+        return pd.read_parquet(path)
+    return None
+
+
+def _save_cache(df: pd.DataFrame, product: str, date_str: str):
+    """Save raw DataFrame to cache."""
+    if df is not None and not df.empty:
+        path = _cache_path(product, date_str)
+        df.to_parquet(path, compression="snappy")
+
+
+# ──────────────────────────────────────────────
+# RT LMP (5-min SCED) via ErcotAPI
+# ──────────────────────────────────────────────
+
+def fetch_rt_lmp(start: str, end: str, location: str = "HB_HUBAVG") -> pd.DataFrame:
+    """
+    Fetch RT LMPs from ErcotAPI (NP6-788-CD, 5-min SCED intervals).
+
+    Returns DataFrame with columns:
+        Interval Start, Interval End, SCED Timestamp, Market, Location, Location Type, LMP
+
+    Filtered to the specified location (default: HB_HUBAVG).
+    """
+    start_ts = pd.Timestamp(start)
+    end_ts = pd.Timestamp(end)
+
+    all_frames = []
+    current = start_ts
+    while current < end_ts:
+        next_day = current + pd.Timedelta(days=1)
+        if next_day > end_ts:
+            next_day = end_ts
+        date_str = current.strftime("%Y-%m-%d")
+
+        cached = _load_cached("rt_lmp", date_str)
+        if cached is not None:
+            logger.info(f"RT LMP {date_str}: loaded from cache ({len(cached)} rows)")
+            all_frames.append(cached)
+            current = next_day
+            continue
+
+        logger.info(f"RT LMP {date_str}: fetching from ErcotAPI...")
         try:
-            from gridstatus.ercot_api.ercot_api import ErcotAPI  # type: ignore
-        except ImportError as e:
-            raise ImportError(
-                "ErcotAPI not available in this gridstatus install. "
-                "Ensure gridstatus>=0.34.0 is installed."
-            ) from e
+            api = _get_api()
+            df = api.get_lmp_by_settlement_point(
+                date=date_str,
+                end=next_day.strftime("%Y-%m-%d"),
+                verbose=False,
+            )
+            # Filter to requested location before caching
+            if not df.empty and "Location" in df.columns:
+                df = df[df["Location"] == location].reset_index(drop=True)
+            logger.info(f"RT LMP {date_str}: got {len(df)} rows")
+            _save_cache(df, "rt_lmp", date_str)
+            all_frames.append(df)
+        except Exception as e:
+            logger.warning(f"RT LMP {date_str}: fetch failed ({e}), skipping")
+        current = next_day
 
-    # ErcotAPI will look for credentials in environment or allow anonymous
-    # for public endpoints. Check gridstatus docs for auth setup.
-    return ErcotAPI()
-
-
-def get_ercot_scraper():
-    """
-    Initialize gridstatus Ercot web scraper client.
-    No credentials needed — scrapes public ERCOT website.
-    """
-    try:
-        from gridstatus import Ercot
-    except ImportError:
-        raise ImportError(
-            "gridstatus not installed. Run: pip install gridstatus>=0.34.0"
-        )
-
-    return Ercot()
+    if not all_frames:
+        return pd.DataFrame()
+    return pd.concat(all_frames, ignore_index=True)
 
 
 # ──────────────────────────────────────────────
-# Energy Price Fetchers
+# DAM SPP (hourly) via scraper yearly bulk
 # ──────────────────────────────────────────────
 
-def fetch_rt_spp(
-    start: str,
-    end: str,
-    verbose: bool = True,
-) -> pd.DataFrame:
+def fetch_dam_spp(start: str, end: str, location: str = "HB_HUBAVG") -> pd.DataFrame:
     """
-    Fetch real-time Settlement Point Prices.
+    Fetch DAM SPPs via scraper yearly bulk download.
 
-    Uses gridstatus Ercot scraper which provides SPP data across the
-    full historical range via ERCOT's public website.
-
-    Parameters
-    ----------
-    start, end : str
-        Date range (e.g., '2024-01-01', '2024-02-01').
-
-    Returns
-    -------
-    pd.DataFrame
-        Columns vary by gridstatus version. Inspect output during
-        Day 1 exploration and update column mappings in schema.py.
+    Returns long-format DataFrame filtered to specified location.
+    Columns: Time, Interval Start, Interval End, Location, Location Type, Market, SPP
     """
-    ercot = get_ercot_scraper()
+    start_ts = pd.Timestamp(start)
+    end_ts = pd.Timestamp(end)
+    years = range(start_ts.year, end_ts.year + 1)
 
-    if verbose:
-        logger.info(f"Fetching RT SPP: {start} to {end}")
+    scraper = _get_scraper()
+    frames = []
+    for year in years:
+        cache_key = f"dam_spp_year_{year}"
+        cached = _load_cached("dam_spp", str(year))
+        if cached is not None:
+            logger.info(f"DAM SPP {year}: loaded from cache ({len(cached)} rows)")
+            frames.append(cached)
+            continue
 
-    try:
-        df = ercot.get_spp(
-            date=start,
-            end=end,
-            market="REAL_TIME_15_MIN",
-            verbose=verbose,
-        )
-        if isinstance(df, pd.DataFrame) and not df.empty:
-            return df
-    except Exception as e:
-        logger.warning(f"get_spp REAL_TIME_15_MIN failed: {e}")
+        logger.info(f"DAM SPP {year}: fetching yearly bulk...")
+        df = scraper.get_dam_spp(year=year, verbose=False)
+        # Filter to location before caching
+        if not df.empty and "Location" in df.columns:
+            df = df[df["Location"] == location].reset_index(drop=True)
+        _save_cache(df, "dam_spp", str(year))
+        logger.info(f"DAM SPP {year}: got {len(df)} rows")
+        frames.append(df)
 
-    # Fallback for gridstatus versions where get_spp has flaky behavior.
-    try:
-        start_ts = pd.Timestamp(start)
-        end_ts = pd.Timestamp(end)
-        years = range(start_ts.year, end_ts.year + 1)
-        frames = []
-        for y in years:
-            try:
-                yearly = ercot.get_rtm_spp(year=y, verbose=verbose)
-                frames.append(_filter_by_datetime_window(yearly, start, end))
-            except Exception as year_err:
-                logger.warning(f"get_rtm_spp(year={y}) failed: {year_err}")
-        if frames:
-            return pd.concat(frames, ignore_index=True)
-    except Exception as e:
-        logger.warning(f"Failed to fetch RT SPP via fallback get_rtm_spp: {e}")
+    if not frames:
+        return pd.DataFrame()
 
-    return pd.DataFrame()
-
-
-def fetch_dam_spp(
-    start: str,
-    end: str,
-    verbose: bool = True,
-) -> pd.DataFrame:
-    """Fetch day-ahead Settlement Point Prices."""
-    ercot = get_ercot_scraper()
-
-    if verbose:
-        logger.info(f"Fetching DAM SPP: {start} to {end}")
-
-    try:
-        df = ercot.get_spp(
-            date=start,
-            end=end,
-            market="DAY_AHEAD_HOURLY",
-            verbose=verbose,
-        )
-        if isinstance(df, pd.DataFrame) and not df.empty:
-            return df
-    except Exception as e:
-        logger.warning(f"get_spp DAY_AHEAD_HOURLY failed: {e}")
-
-    try:
-        start_ts = pd.Timestamp(start)
-        end_ts = pd.Timestamp(end)
-        years = range(start_ts.year, end_ts.year + 1)
-        frames = []
-        for y in years:
-            try:
-                yearly = ercot.get_dam_spp(year=y, verbose=verbose)
-                frames.append(_filter_by_datetime_window(yearly, start, end))
-            except Exception as year_err:
-                logger.warning(f"get_dam_spp(year={y}) failed: {year_err}")
-        if frames:
-            return pd.concat(frames, ignore_index=True)
-    except Exception as e:
-        logger.warning(f"Failed to fetch DAM SPP via fallback get_dam_spp: {e}")
-
-    return pd.DataFrame()
-
-
-# ──────────────────────────────────────────────
-# Ancillary Service Price Fetchers
-# ──────────────────────────────────────────────
-
-def fetch_dam_as_prices(
-    start: str,
-    end: str,
-    verbose: bool = True,
-) -> pd.DataFrame:
-    """
-    Fetch day-ahead AS clearing prices.
-    Available for full historical period (2010+).
-    """
-    ercot = get_ercot_scraper()
-
-    if verbose:
-        logger.info(f"Fetching DAM AS prices: {start} to {end}")
-
-    try:
-        df = ercot.get_as_prices(
-            date=start,
-            end=end,
-            verbose=verbose,
-        )
-        return df
-    except Exception as e:
-        logger.error(f"Failed to fetch DAM AS prices: {e}")
-        raise
-
-
-def fetch_rt_as_prices(
-    start: str,
-    end: str,
-    verbose: bool = True,
-) -> pd.DataFrame:
-    """
-    Fetch real-time AS MCPCs (post-RTC+B only, from Dec 5, 2025).
-
-    This data product (NP6-332-CD) only exists after RTC+B go-live.
-    Calling this for dates before Dec 5, 2025 will return empty results.
-
-    The exact gridstatus method name varies by version. This function
-    tries known candidates before falling back to report-type fetch.
-    """
-    if verbose:
-        logger.info(f"Fetching RT AS MCPCs: {start} to {end}")
-
-    # Try scraper methods first (some gridstatus versions expose these).
-    try:
-        ercot = get_ercot_scraper()
-        scraper_candidates = [
-            "get_as_mcpc",
-            "get_rt_as_clearing_prices",
-            "get_as_clearing_prices",
-            "get_mcpc",
-            "get_mcpc_sced",
-            "get_mcpc_real_time_15_min",
-            "get_indicative_mcpc_rtd",
+    combined = pd.concat(frames, ignore_index=True)
+    # Filter to date range
+    if "Interval Start" in combined.columns:
+        combined["Interval Start"] = pd.to_datetime(combined["Interval Start"], utc=True)
+        start_utc = pd.Timestamp(start, tz="UTC")
+        end_utc = pd.Timestamp(end, tz="UTC")
+        combined = combined[
+            (combined["Interval Start"] >= start_utc)
+            & (combined["Interval Start"] < end_utc)
         ]
-        for method_name in scraper_candidates:
-            try:
-                df = _call_method_if_exists(
-                    ercot,
-                    method_name,
-                    date=start,
-                    end=end,
-                    verbose=verbose,
-                )
-            except TypeError:
-                # Some methods may not accept verbose/date kwarg names.
-                df = _call_method_if_exists(ercot, method_name, start=start, end=end)
-            if isinstance(df, pd.DataFrame):
-                logger.info(f"Fetched RT AS via Ercot.{method_name}()")
-                return df
-    except Exception as e:
-        logger.warning(f"Scraper RT AS method attempts failed: {e}")
-
-    # API path: named methods first, then generic report_type_id fallback.
-    try:
-        api = get_ercot_api()
-    except Exception as e:
-        msg = str(e)
-        if "Username, password, and subscription key must be provided" in msg:
-            logger.warning("ERCOT API credentials not configured; returning empty RT AS DataFrame.")
-            return pd.DataFrame()
-        raise
-    api_candidates = [
-        "get_as_mcpc",
-        "get_rt_as_clearing_prices",
-        "get_as_clearing_prices",
-    ]
-    for method_name in api_candidates:
-        try:
-            df = _call_method_if_exists(api, method_name, start=start, end=end)
-            if isinstance(df, pd.DataFrame):
-                logger.info(f"Fetched RT AS via ErcotAPI.{method_name}()")
-                return df
-        except Exception as e:
-            logger.debug(f"ErcotAPI.{method_name} failed: {e}")
-
-    try:
-        df = api.get_data(
-            report_type_id="NP6-332-CD",
-            start=start,
-            end=end,
-        )
-        if isinstance(df, pd.DataFrame):
-            logger.info("Fetched RT AS via ErcotAPI.get_data(report_type_id='NP6-332-CD')")
-            return df
-    except Exception as e:
-        msg = str(e)
-        if "Username, password, and subscription key must be provided" in msg:
-            logger.warning("ERCOT API credentials not configured; returning empty RT AS DataFrame.")
-            return pd.DataFrame()
-        logger.error(f"Failed RT AS fallback fetch (NP6-332-CD): {e}")
-        raise
-
-    logger.warning("No RT AS MCPC method succeeded; returning empty DataFrame.")
-    return pd.DataFrame()
+    return combined.reset_index(drop=True)
 
 
 # ──────────────────────────────────────────────
-# System Conditions Fetchers
+# DAM AS Prices (hourly) via ErcotAPI
 # ──────────────────────────────────────────────
 
-def fetch_load(
-    start: str,
-    end: str,
-    verbose: bool = True,
-) -> pd.DataFrame:
-    """Fetch system load data (actual + forecast)."""
-    ercot = get_ercot_scraper()
+def fetch_dam_as(start: str, end: str) -> pd.DataFrame:
+    """
+    Fetch DAM AS clearing prices from ErcotAPI (NP4-188-CD).
 
-    if verbose:
-        logger.info(f"Fetching load data: {start} to {end}")
-
+    Returns wide-format DataFrame with columns:
+        Interval Start, Interval End, Market,
+        Non-Spinning Reserves, Regulation Down, Regulation Up,
+        Responsive Reserves, ERCOT Contingency Reserve Service
+    """
+    logger.info(f"DAM AS: fetching {start} → {end}...")
     try:
-        df = ercot.get_load(
-            date=start,
-            end=end,
-            verbose=verbose,
-        )
+        api = _get_api()
+        df = api.get_as_prices(date=start, end=end, verbose=False)
+        logger.info(f"DAM AS: got {len(df)} rows")
         return df
     except Exception as e:
-        logger.error(f"Failed to fetch load: {e}")
-        raise
-
-
-def fetch_fuel_mix(
-    start: str,
-    end: str,
-    verbose: bool = True,
-) -> pd.DataFrame:
-    """Fetch generation by fuel type."""
-    ercot = get_ercot_scraper()
-
-    if verbose:
-        logger.info(f"Fetching fuel mix: {start} to {end}")
-
-    try:
-        # get_fuel_mix currently works best with single-date calls.
-        frames = []
-        for day in pd.date_range(start=start, end=end, inclusive="left", freq="1D"):
-            try:
-                day_df = ercot.get_fuel_mix(
-                    date=day.date().isoformat(),
-                    verbose=verbose,
-                )
-                if isinstance(day_df, pd.DataFrame) and not day_df.empty:
-                    frames.append(day_df)
-            except Exception as day_err:
-                logger.warning(f"Fuel mix fetch failed for {day.date()}: {day_err}")
-
-        if not frames:
-            return pd.DataFrame()
-        return pd.concat(frames, ignore_index=True)
-    except Exception as e:
-        logger.error(f"Failed to fetch fuel mix: {e}")
-        raise
-
-
-def fetch_wind_solar(
-    start: str,
-    end: str,
-    verbose: bool = True,
-) -> dict[str, pd.DataFrame]:
-    """
-    Fetch wind and solar generation data (actuals + forecasts).
-
-    Returns
-    -------
-    dict with keys 'wind' and 'solar', each a DataFrame.
-    """
-    ercot = get_ercot_scraper()
-    results = {}
-
-    if verbose:
-        logger.info(f"Fetching wind/solar: {start} to {end}")
-
-    results["wind"] = pd.DataFrame()
-    results["solar"] = pd.DataFrame()
-
-    wind_methods = [
-        "get_wind_actual_and_forecast_hourly",
-        "get_wind_actual_and_forecast_by_geographical_region_hourly",
-    ]
-    solar_methods = [
-        "get_solar_actual_and_forecast_hourly",
-        "get_solar_actual_and_forecast_by_geographical_region_hourly",
-    ]
-
-    for method_name in wind_methods:
-        try:
-            df = _call_method_if_exists(ercot, method_name, date=start, end=end, verbose=verbose)
-            if isinstance(df, pd.DataFrame) and not df.empty:
-                results["wind"] = df
-                break
-        except Exception as e:
-            logger.warning(f"{method_name} failed (wind): {e}")
-
-    for method_name in solar_methods:
-        try:
-            df = _call_method_if_exists(ercot, method_name, date=start, end=end, verbose=verbose)
-            if isinstance(df, pd.DataFrame) and not df.empty:
-                results["solar"] = df
-                break
-        except Exception as e:
-            logger.warning(f"{method_name} failed (solar): {e}")
-
-    return results
+        logger.warning(f"DAM AS: fetch failed ({e}), returning empty")
+        return pd.DataFrame()
 
 
 # ──────────────────────────────────────────────
-# Exploration Helper
+# Load Actual (hourly) via scraper
 # ──────────────────────────────────────────────
 
-def explore_available_methods():
+def fetch_load_actual(start: str, end: str) -> pd.DataFrame:
     """
-    Print all available gridstatus methods for ERCOT.
-    Run this on Day 1 to discover what data is accessible.
+    Fetch hourly actual load via scraper's post-settlements archive.
+
+    Returns DataFrame with columns:
+        Interval Start, Interval End, Coast, East, Far West, North,
+        North Central, South, South Central, West, ERCOT
     """
-    ercot = get_ercot_scraper()
+    start_ts = pd.Timestamp(start)
+    end_ts = pd.Timestamp(end)
+    years = range(start_ts.year, end_ts.year + 1)
 
-    print("=" * 60)
-    print("gridstatus.Ercot — Available methods:")
-    print("=" * 60)
-    methods = [m for m in dir(ercot) if m.startswith("get_")]
-    for m in sorted(methods):
-        doc = getattr(ercot, m).__doc__
-        first_line = doc.strip().split("\n")[0] if doc else "(no docstring)"
-        print(f"  .{m}() — {first_line}")
+    scraper = _get_scraper()
+    frames = []
+    for year in years:
+        cached = _load_cached("load_actual", str(year))
+        if cached is not None:
+            logger.info(f"Load actual {year}: loaded from cache ({len(cached)} rows)")
+            frames.append(cached)
+            continue
 
+        logger.info(f"Load actual {year}: fetching yearly archive...")
+        df = scraper.get_hourly_load_post_settlements(
+            date=f"{year}-01-01", verbose=False
+        )
+        _save_cache(df, "load_actual", str(year))
+        logger.info(f"Load actual {year}: got {len(df)} rows")
+        frames.append(df)
+
+    if not frames:
+        return pd.DataFrame()
+
+    combined = pd.concat(frames, ignore_index=True)
+    if "Interval Start" in combined.columns:
+        combined["Interval Start"] = pd.to_datetime(combined["Interval Start"], utc=True)
+        start_utc = pd.Timestamp(start, tz="UTC")
+        end_utc = pd.Timestamp(end, tz="UTC")
+        combined = combined[
+            (combined["Interval Start"] >= start_utc)
+            & (combined["Interval Start"] < end_utc)
+        ]
+    return combined.reset_index(drop=True)
+
+
+# ──────────────────────────────────────────────
+# Load Forecast (hourly) via ErcotAPI
+# ──────────────────────────────────────────────
+
+def fetch_load_forecast(start: str, end: str) -> pd.DataFrame:
+    """
+    Fetch hourly load forecast from ErcotAPI (NP3-565-CD).
+
+    Returns DataFrame with columns:
+        Interval Start, Interval End, Publish Time, Model,
+        Coast, East, Far West, North, North Central,
+        South Central, Southern, West, System Total, In Use Flag
+    """
+    logger.info(f"Load forecast: fetching {start} → {end}...")
     try:
-        api = get_ercot_api()
-        print("\n" + "=" * 60)
-        print("gridstatus.ErcotAPI — Available methods:")
-        print("=" * 60)
-        methods = [m for m in dir(api) if m.startswith("get_")]
-        for m in sorted(methods):
-            doc = getattr(api, m).__doc__
-            first_line = doc.strip().split("\n")[0] if doc else "(no docstring)"
-            print(f"  .{m}() — {first_line}")
+        api = _get_api()
+        df = api.get_load_forecast_by_model(date=start, end=end, verbose=False)
+        logger.info(f"Load forecast: got {len(df)} rows")
+        return df
     except Exception as e:
-        print(f"\nErcotAPI not available (credentials needed?): {e}")
+        logger.warning(f"Load forecast: fetch failed ({e}), returning empty")
+        return pd.DataFrame()
 
 
-if __name__ == "__main__":
-    explore_available_methods()
+# ──────────────────────────────────────────────
+# Wind (hourly) via ErcotAPI
+# ──────────────────────────────────────────────
+
+def fetch_wind(start: str, end: str) -> pd.DataFrame:
+    """
+    Fetch wind actual + forecast from ErcotAPI (NP4-732-CD).
+
+    Returns DataFrame with columns including:
+        Interval Start, Interval End, Publish Time,
+        GEN SYSTEM WIDE, STWPF SYSTEM WIDE, ...
+    """
+    logger.info(f"Wind: fetching {start} → {end}...")
+    try:
+        api = _get_api()
+        df = api.get_wind_actual_and_forecast_hourly(date=start, end=end, verbose=False)
+        logger.info(f"Wind: got {len(df)} rows")
+        return df
+    except Exception as e:
+        logger.warning(f"Wind: fetch failed ({e}), returning empty")
+        return pd.DataFrame()
+
+
+# ──────────────────────────────────────────────
+# Solar (hourly) via ErcotAPI
+# ──────────────────────────────────────────────
+
+def fetch_solar(start: str, end: str) -> pd.DataFrame:
+    """
+    Fetch solar actual + forecast from ErcotAPI (NP4-737-CD).
+
+    Returns DataFrame with columns including:
+        Interval Start, Interval End, Publish Time,
+        GEN SYSTEM WIDE, STPPF SYSTEM WIDE, ...
+    """
+    logger.info(f"Solar: fetching {start} → {end}...")
+    try:
+        api = _get_api()
+        df = api.get_solar_actual_and_forecast_hourly(date=start, end=end, verbose=False)
+        logger.info(f"Solar: got {len(df)} rows")
+        return df
+    except Exception as e:
+        logger.warning(f"Solar: fetch failed ({e}), returning empty")
+        return pd.DataFrame()
+
+
+# ──────────────────────────────────────────────
+# RT SCED MCPC — file loader (pre-downloaded)
+# ──────────────────────────────────────────────
+
+def load_rt_mcpc(start: str, end: str) -> pd.DataFrame:
+    """
+    Load RT SCED MCPCs from pre-downloaded Parquet files.
+
+    Files expected at: data/raw/sced_mcpc/YYYY-MM-DD.parquet
+    Long format columns: SCEDTimestamp, RepeatedHourFlag, ASType, MCPC
+
+    Returns empty DataFrame if no files found (pre-RTC+B dates).
+    """
+    mcpc_dir = DATA_RAW / "sced_mcpc"
+    if not mcpc_dir.exists():
+        logger.info("RT MCPC: no sced_mcpc directory found, returning empty")
+        return pd.DataFrame()
+
+    start_date = pd.Timestamp(start).date()
+    end_date = pd.Timestamp(end).date()
+
+    frames = []
+    current = start_date
+    while current < end_date:
+        path = mcpc_dir / f"{current.isoformat()}.parquet"
+        if path.exists():
+            df = pd.read_parquet(path)
+            frames.append(df)
+        current += pd.Timedelta(days=1)
+
+    if not frames:
+        logger.info(f"RT MCPC: no files found for {start} → {end}")
+        return pd.DataFrame()
+
+    combined = pd.concat(frames, ignore_index=True)
+    logger.info(f"RT MCPC: loaded {len(combined)} rows from {len(frames)} files")
+    return combined

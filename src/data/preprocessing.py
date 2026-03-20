@@ -1,485 +1,397 @@
 """
 Data preprocessing — transforms raw gridstatus DataFrames into
-canonical Parquet schema.
+canonical Parquet schema (5-min UTC intervals).
 
-Key operations:
-  - Timestamp normalization (CPT → UTC)
-  - Resampling to 5-minute intervals
-  - Column renaming to canonical names
-  - Adding is_post_rtcb flag
-  - NaN insertion for pre-RTC+B AS columns
-  - Data quality validation
+Each process_* function takes raw DataFrames (as returned by the fetcher)
+and produces a DataFrame indexed by 5-min UTC timestamps with canonical
+column names.
 """
 
 import logging
-import re
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import pyarrow as pa
-import pyarrow.parquet as pq
 
-from ..utils.time_utils import (
-    RTCB_GO_LIVE,
-    add_post_rtcb_flag,
-    make_5min_index,
-    resample_to_5min,
-)
+from .schema import DAM_AS_COLUMN_MAP, RT_MCPC_ASTYPE_MAP, RTCB_BOUNDARY_UTC
 
 logger = logging.getLogger(__name__)
 
-
-def _norm_col_name(col: str) -> str:
-    """Normalize a column name for fuzzy matching."""
-    return re.sub(r"[^a-z0-9]", "", str(col).lower())
+RTCB_UTC = pd.Timestamp(RTCB_BOUNDARY_UTC, tz="UTC")
 
 
-def _find_first_column(df: pd.DataFrame, candidates: list[str]) -> str | None:
-    """Return the first matching column from candidates (exact or normalized)."""
-    if df.empty:
-        return None
-
-    by_norm = {_norm_col_name(c): c for c in df.columns}
-    for cand in candidates:
-        if cand in df.columns:
-            return cand
-        norm = _norm_col_name(cand)
-        if norm in by_norm:
-            return by_norm[norm]
-
-    for col in df.columns:
-        ncol = _norm_col_name(col)
-        if any(_norm_col_name(c) in ncol for c in candidates):
-            return col
-
-    return None
+def _to_utc_index(df: pd.DataFrame, col: str = "Interval Start") -> pd.Series:
+    """Convert a timestamp column to UTC, return as Series."""
+    ts = pd.to_datetime(df[col])
+    if ts.dt.tz is None:
+        ts = ts.dt.tz_localize("US/Central", ambiguous="NaT", nonexistent="shift_forward")
+    return ts.dt.tz_convert("UTC")
 
 
-def _find_price_column(df: pd.DataFrame) -> str | None:
-    """Find likely price column in ERCOT market datasets."""
-    return _find_first_column(
-        df,
-        [
-            "SPP",
-            "LMP",
-            "MCPC",
-            "Settlement Point Price",
-            "Price",
-            "Clearing Price",
-            "Market Clearing Price",
-        ],
+def _floor_5min(ts: pd.Series) -> pd.Series:
+    """Floor timestamps to the nearest 5-minute boundary."""
+    return ts.dt.floor("5min")
+
+
+def _make_5min_index(start: str, end: str) -> pd.DatetimeIndex:
+    """Create a canonical 5-min UTC DatetimeIndex for [start, end)."""
+    return pd.date_range(
+        start=pd.Timestamp(start, tz="UTC"),
+        end=pd.Timestamp(end, tz="UTC"),
+        freq="5min",
+        inclusive="left",
     )
 
 
-def _extract_hub_and_zones(df: pd.DataFrame, prefix: str) -> pd.DataFrame:
-    """
-    Extract hub and load-zone prices from long-format SPP/LMP data.
-
-    Expected long format columns (version-dependent):
-      - location column (Location/Settlement Point/...)
-      - location type column (Location Type/...)
-      - price column (SPP/LMP/Price/...)
-    """
-    if df.empty:
-        return pd.DataFrame(index=df.index)
-
-    price_col = _find_price_column(df)
-    loc_col = _find_first_column(df, ["Location", "Settlement Point", "Point", "Node"])
-    loc_type_col = _find_first_column(df, ["Location Type", "Settlement Point Type", "Type"])
-
-    if price_col is None:
-        return pd.DataFrame(index=df.index)
-
-    out = pd.DataFrame(index=df.index.unique().sort_values())
-
-    if loc_col is None:
-        # Wide/single-series fallback
-        out[f"{prefix}_hub"] = df.groupby(df.index)[price_col].mean()
-        return out
-
-    work = df[[price_col, loc_col] + ([loc_type_col] if loc_type_col else [])].copy()
-    work[loc_col] = work[loc_col].astype(str)
-    ts_col = work.index.name or "timestamp"
-    work = work.reset_index().rename(columns={work.index.name or "index": ts_col})
-
-    # Aggregate repeated rows at same timestamp/location.
-    long = (
-        work.groupby([ts_col, loc_col], as_index=False)[price_col]
-        .mean()
-        .rename(columns={price_col: "price", loc_col: "location"})
-    )
-
-    pivot = long.pivot(index=ts_col, columns="location", values="price")
-
-    zone_aliases = {
-        f"{prefix}_north": ["LZ_NORTH", "NORTH"],
-        f"{prefix}_south": ["LZ_SOUTH", "SOUTH"],
-        f"{prefix}_west": ["LZ_WEST", "WEST"],
-        f"{prefix}_houston": ["LZ_HOUSTON", "HOUSTON"],
-    }
-
-    # Zone-level columns where available.
-    for out_col, aliases in zone_aliases.items():
-        matched = [c for c in pivot.columns if any(a in str(c).upper() for a in aliases)]
-        if matched:
-            out[out_col] = pivot[matched].mean(axis=1)
-
-    # Hub: prefer explicit HUB location-type rows if present, otherwise hub-like names.
-    hub_series = None
-    if loc_type_col is not None:
-        with_type = df[[price_col, loc_type_col]].copy()
-        hub_rows = with_type[with_type[loc_type_col].astype(str).str.upper().str.contains("HUB", na=False)]
-        if not hub_rows.empty:
-            hub_series = hub_rows.groupby(hub_rows.index)[price_col].mean()
-
-    if hub_series is None:
-        hub_like_cols = [c for c in pivot.columns if "HUB" in str(c).upper()]
-        if hub_like_cols:
-            hub_series = pivot[hub_like_cols].mean(axis=1)
-
-    if hub_series is None:
-        # Last-resort fallback: average all available locations.
-        hub_series = df.groupby(df.index)[price_col].mean()
-
-    out[f"{prefix}_hub"] = hub_series
-    return out
+def _add_rtcb_flag(df: pd.DataFrame) -> pd.DataFrame:
+    """Add is_post_rtcb column based on the index."""
+    df["is_post_rtcb"] = df.index >= RTCB_UTC
+    return df
 
 
-def _extract_as_wide(df: pd.DataFrame, out_prefix: str) -> pd.DataFrame:
-    """Extract AS products from wide-format columns."""
-    out = pd.DataFrame(index=df.index.unique().sort_values())
-
-    product_map = {
-        "regup": ["regup", "regupmw", "regupprice", "regupmcpc", "regupclearingprice", "regulationup"],
-        "regdown": ["regdn", "regdown", "regdownmw", "regdownprice", "regdownmcpc", "regulationdown"],
-        "rrs": ["rrs", "responsivereserve", "rrsmw", "rrsprice", "rrsmcpc"],
-        "ecrs": ["ecrs", "ercotcontingencyreserve", "ercotcontingencyreserveservice", "ecrsmw", "ecrsprice", "ecrsmcpc"],
-        "nsrs": ["nsrs", "nonspin", "nonspinningreserve", "nsrsmw", "nsrsprice", "nsrsmcpc"],
-    }
-
-    grouped_mean = df.groupby(df.index).mean(numeric_only=True)
-
-    for product, aliases in product_map.items():
-        matched = []
-        for col in grouped_mean.columns:
-            ncol = _norm_col_name(col)
-            if any(alias in ncol for alias in aliases):
-                matched.append(col)
-
-        out_col = f"{out_prefix}_{product}"
-        if matched:
-            out[out_col] = grouped_mean[matched].mean(axis=1)
-        else:
-            out[out_col] = np.nan
-
-    return out
-
-
-def _extract_as_long(df: pd.DataFrame, out_prefix: str) -> pd.DataFrame | None:
-    """Extract AS products from long-format rows with a product/service column."""
-    prod_col = _find_first_column(
-        df,
-        [
-            "Ancillary Type",
-            "AS Type",
-            "Service",
-            "Product",
-            "AS Product",
-            "Service Type",
-            "Ancillary Service",
-        ],
-    )
-    price_col = _find_price_column(df)
-
-    if prod_col is None or price_col is None:
-        return None
-
-    work = df[[prod_col, price_col]].copy()
-    work[prod_col] = work[prod_col].astype(str).str.upper()
-
-    product_aliases = {
-        "regup": ["REGUP", "REG-UP", "REG_UP", "REGULATION UP"],
-        "regdown": ["REGDN", "REGDOWN", "REG-DOWN", "REG_DOWN", "REGULATION DOWN"],
-        "rrs": ["RRS", "RESPONSIVE"],
-        "ecrs": ["ECRS", "CONTINGENCY"],
-        "nsrs": ["NSRS", "NONSPIN", "NON-SPIN"],
-    }
-
-    out = pd.DataFrame(index=df.index.unique().sort_values())
-    for product, aliases in product_aliases.items():
-        mask = work[prod_col].apply(lambda v: any(a in v for a in aliases))
-        series = work.loc[mask].groupby(work.loc[mask].index)[price_col].mean()
-        out[f"{out_prefix}_{product}"] = series
-
-    return out
-
-
-def normalize_timestamp_index(
-    df: pd.DataFrame,
-    time_col: str = "Time",
-) -> pd.DataFrame:
-    """
-    Ensure DataFrame has a UTC DatetimeIndex.
-
-    gridstatus typically returns data with a 'Time' column or
-    datetime index already localized. This normalizes to UTC.
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Raw gridstatus output.
-    time_col : str
-        Name of the time column if not already the index.
-    """
-    df = df.copy()
-
-    # If time is a column, set it as index
-    if time_col in df.columns:
-        df = df.set_index(time_col)
-    elif "Interval Start" in df.columns:
-        df = df.set_index("Interval Start")
-    elif "Interval End" in df.columns:
-        df = df.set_index("Interval End")
-        # Shift back by interval duration to get start time
-        if hasattr(df.index, 'freq') and df.index.freq:
-            df.index = df.index - df.index.freq
-
-    # Ensure datetime type
-    if not isinstance(df.index, pd.DatetimeIndex):
-        df.index = pd.to_datetime(df.index)
-
-    # Localize to UTC
-    if df.index.tz is None:
-        # Assume CPT if no timezone
-        df.index = df.index.tz_localize("US/Central", ambiguous="NaT").tz_convert("UTC")
-    elif str(df.index.tz) != "UTC":
-        df.index = df.index.tz_convert("UTC")
-
-    df.index.name = "timestamp"
-    return df.sort_index()
-
-
-def align_to_5min(
-    df: pd.DataFrame,
-    method: str = "ffill",
-) -> pd.DataFrame:
-    """
-    Resample any DataFrame to 5-minute canonical intervals.
-
-    For data at coarser granularity (15-min, hourly), forward-fills
-    to maintain the last known value at each 5-min tick.
-    """
-    df = normalize_timestamp_index(df)
-
-    # Detect source frequency
-    if len(df) > 1:
-        median_diff = df.index.to_series().diff().median()
-        logger.info(f"Detected source frequency: {median_diff}")
-
-    return resample_to_5min(df, method=method)
-
+# ──────────────────────────────────────────────
+# Energy Prices
+# ──────────────────────────────────────────────
 
 def process_energy_prices(
-    rt_spp_df: pd.DataFrame,
+    rt_lmp_df: pd.DataFrame,
     dam_spp_df: pd.DataFrame,
+    start: str,
+    end: str,
 ) -> pd.DataFrame:
     """
-    Process raw energy price DataFrames into canonical schema.
+    Process RT LMP + DAM SPP into canonical energy_prices table.
 
-    Handles both long-format (location + price rows) and wide-format
-    (already split columns) gridstatus outputs.
+    rt_lmp_df: from fetch_rt_lmp() — columns include Interval Start, LMP
+    dam_spp_df: from fetch_dam_spp() — columns include Interval Start, SPP
     """
-    rt = normalize_timestamp_index(rt_spp_df)
-    dam = normalize_timestamp_index(dam_spp_df)
+    idx = _make_5min_index(start, end)
+    result = pd.DataFrame(index=idx)
+    result.index.name = "timestamp_utc"
 
-    rt_extracted = _extract_hub_and_zones(rt, prefix="rt_spp")
-    dam_extracted = _extract_hub_and_zones(dam, prefix="dam_spp")
+    # --- RT LMP (already 5-min, just align) ---
+    if not rt_lmp_df.empty:
+        rt = rt_lmp_df.copy()
+        rt["ts_utc"] = _floor_5min(_to_utc_index(rt))
+        # If multiple SCED runs per 5-min interval, take the last one
+        rt = rt.sort_values("SCED Timestamp" if "SCED Timestamp" in rt.columns else "ts_utc")
+        rt = rt.drop_duplicates(subset=["ts_utc"], keep="last")
+        rt = rt.set_index("ts_utc")["LMP"]
+        result["rt_lmp"] = rt
+        logger.info(f"  RT LMP: {rt.notna().sum()} values mapped")
+    else:
+        result["rt_lmp"] = np.nan
 
-    rt_5min = resample_to_5min(rt_extracted)
-    dam_5min = resample_to_5min(dam_extracted)
+    # --- DAM SPP (hourly → ffill to 5-min) ---
+    if not dam_spp_df.empty:
+        dam = dam_spp_df.copy()
+        dam["ts_utc"] = _to_utc_index(dam)
+        dam = dam.drop_duplicates(subset=["ts_utc"], keep="last")
+        dam = dam.set_index("ts_utc")["SPP"]
+        # Reindex to 5-min then forward-fill
+        dam_aligned = dam.reindex(idx)
+        dam_aligned = dam_aligned.ffill()
+        result["dam_spp"] = dam_aligned
+        logger.info(f"  DAM SPP: {dam_aligned.notna().sum()} values after ffill")
+    else:
+        result["dam_spp"] = np.nan
 
-    result = rt_5min.join(dam_5min[["dam_spp_hub"]], how="outer")
-
-    # Ensure schema columns are present even if unavailable in source data.
-    for col in ["rt_spp_hub", "rt_spp_north", "rt_spp_south", "rt_spp_west", "rt_spp_houston", "dam_spp_hub"]:
-        if col not in result.columns:
-            result[col] = np.nan
-
-    result = result.sort_index()
-    result = add_post_rtcb_flag(result)
+    result = _add_rtcb_flag(result)
     return result
 
+
+# ──────────────────────────────────────────────
+# AS Prices
+# ──────────────────────────────────────────────
 
 def process_as_prices(
     dam_as_df: pd.DataFrame,
-    rt_as_df: pd.DataFrame = None,
+    rt_mcpc_df: pd.DataFrame,
+    start: str,
+    end: str,
 ) -> pd.DataFrame:
     """
-    Process AS price DataFrames into canonical schema.
+    Process DAM AS + RT MCPC into canonical as_prices table.
 
-    Supports both wide and long DataFrame shapes for DAM and RT inputs.
+    dam_as_df: from fetch_dam_as() — wide format with named AS columns
+    rt_mcpc_df: from load_rt_mcpc() — long format: SCEDTimestamp, ASType, MCPC
     """
-    dam = normalize_timestamp_index(dam_as_df)
-    dam_long = _extract_as_long(dam, out_prefix="dam_as")
-    dam_extracted = dam_long if dam_long is not None else _extract_as_wide(dam, out_prefix="dam_as")
-    dam_5min = resample_to_5min(dam_extracted)
+    idx = _make_5min_index(start, end)
+    result = pd.DataFrame(index=idx)
+    result.index.name = "timestamp_utc"
 
-    result = dam_5min.copy()
+    # --- DAM AS (hourly → ffill to 5-min) ---
+    if not dam_as_df.empty:
+        dam = dam_as_df.copy()
+        dam["ts_utc"] = _to_utc_index(dam)
+        dam = dam.drop_duplicates(subset=["ts_utc"], keep="last")
+        dam = dam.set_index("ts_utc")
 
-    rt_cols = ["rt_mcpc_regup", "rt_mcpc_regdown", "rt_mcpc_rrs", "rt_mcpc_ecrs", "rt_mcpc_nsrs"]
+        for src_col, dst_col in DAM_AS_COLUMN_MAP.items():
+            if src_col in dam.columns:
+                series = dam[src_col].reindex(idx).ffill()
+                result[dst_col] = series
+            else:
+                result[dst_col] = np.nan
+        logger.info(f"  DAM AS: mapped {len(DAM_AS_COLUMN_MAP)} products")
+    else:
+        for dst_col in DAM_AS_COLUMN_MAP.values():
+            result[dst_col] = np.nan
 
-    if rt_as_df is not None and not rt_as_df.empty:
-        rt = normalize_timestamp_index(rt_as_df)
-        rt_long = _extract_as_long(rt, out_prefix="rt_mcpc")
-        rt_extracted = rt_long if rt_long is not None else _extract_as_wide(rt, out_prefix="rt_mcpc")
-        rt_5min = resample_to_5min(rt_extracted)
-        result = result.join(rt_5min[rt_cols], how="outer")
+    # Fill ECRS NaN with 0 for pre-June 2023 (product didn't exist)
+    ecrs_start = pd.Timestamp("2023-06-01", tz="UTC")
+    pre_ecrs = result.index < ecrs_start
+    if "dam_as_ecrs" in result.columns:
+        result.loc[pre_ecrs, "dam_as_ecrs"] = result.loc[pre_ecrs, "dam_as_ecrs"].fillna(0.0)
 
+    # --- RT MCPC (5-min, long → pivot to wide) ---
+    rt_cols = list(RT_MCPC_ASTYPE_MAP.values())
+    if not rt_mcpc_df.empty and "SCEDTimestamp" in rt_mcpc_df.columns:
+        rt = rt_mcpc_df.copy()
+        rt["SCEDTimestamp"] = pd.to_datetime(rt["SCEDTimestamp"], format="%m/%d/%Y %H:%M:%S")
+        # Localize to CPT then convert to UTC
+        rt["ts_utc"] = (
+            rt["SCEDTimestamp"]
+            .dt.tz_localize("US/Central", ambiguous="NaT", nonexistent="shift_forward")
+            .dt.tz_convert("UTC")
+        )
+        rt["ts_utc"] = _floor_5min(rt["ts_utc"])
+
+        # Pivot: one column per AS type
+        pivoted = rt.pivot_table(
+            index="ts_utc", columns="ASType", values="MCPC", aggfunc="last"
+        )
+        for as_type, dst_col in RT_MCPC_ASTYPE_MAP.items():
+            if as_type in pivoted.columns:
+                result[dst_col] = pivoted[as_type].reindex(idx)
+            else:
+                result[dst_col] = np.nan
+        logger.info(f"  RT MCPC: {pivoted.shape[0]} intervals mapped")
+    else:
+        for col in rt_cols:
+            if col not in result.columns:
+                result[col] = np.nan
+
+    # Pre-RTC+B: RT MCPC columns should be NaN
+    pre_rtcb = result.index < RTCB_UTC
     for col in rt_cols:
-        if col not in result.columns:
-            result[col] = np.nan
+        if col in result.columns:
+            result.loc[pre_rtcb, col] = np.nan
 
-    # Pre-RTC+B should have NaN RT MCPC columns.
-    pre_mask = result.index < RTCB_GO_LIVE
-    result.loc[pre_mask, rt_cols] = np.nan
-
-    # Ensure all canonical DAM columns exist.
-    for col in ["dam_as_regup", "dam_as_regdown", "dam_as_rrs", "dam_as_ecrs", "dam_as_nsrs"]:
-        if col not in result.columns:
-            result[col] = np.nan
-
-    result = result.sort_index()
-    result = add_post_rtcb_flag(result)
+    result = _add_rtcb_flag(result)
     return result
+
+
+# ──────────────────────────────────────────────
+# System Conditions
+# ──────────────────────────────────────────────
+
+def _dedup_renewable(df: pd.DataFrame, gen_col: str, forecast_col: str):
+    """
+    Deduplicate wind/solar data which has multiple Publish Times per interval.
+
+    For actuals: take the latest Publish Time per interval (most complete data).
+    For forecasts: take the latest Publish Time that is before the interval start
+                   (operational forecast available at decision time).
+    """
+    if df.empty:
+        return pd.Series(dtype="float64"), pd.Series(dtype="float64")
+
+    df = df.copy()
+    df["ts_utc"] = _to_utc_index(df)
+
+    # Actuals: latest publish time per interval, only where GEN is not NaN
+    if gen_col in df.columns:
+        actuals = df.dropna(subset=[gen_col])
+        if "Publish Time" in actuals.columns:
+            actuals = actuals.sort_values("Publish Time")
+        actuals = actuals.drop_duplicates(subset=["ts_utc"], keep="last")
+        actual_series = actuals.set_index("ts_utc")[gen_col]
+    else:
+        actual_series = pd.Series(dtype="float64")
+
+    # Forecasts: latest publish time before interval start
+    if forecast_col in df.columns:
+        fcast = df.copy()
+        if "Publish Time" in fcast.columns:
+            pub = pd.to_datetime(fcast["Publish Time"])
+            if pub.dt.tz is None:
+                pub = pub.dt.tz_localize("US/Central", ambiguous="NaT").dt.tz_convert("UTC")
+            else:
+                pub = pub.dt.tz_convert("UTC")
+            fcast["pub_utc"] = pub
+            # Only keep forecasts published before the interval
+            fcast = fcast[fcast["pub_utc"] < fcast["ts_utc"]]
+            fcast = fcast.sort_values("pub_utc")
+        fcast = fcast.drop_duplicates(subset=["ts_utc"], keep="last")
+        forecast_series = fcast.set_index("ts_utc")[forecast_col]
+    else:
+        forecast_series = pd.Series(dtype="float64")
+
+    return actual_series, forecast_series
 
 
 def process_system_conditions(
-    load_df: pd.DataFrame,
-    fuel_mix_df: pd.DataFrame = None,
-    wind_df: pd.DataFrame = None,
-    solar_df: pd.DataFrame = None,
+    load_actual_df: pd.DataFrame,
+    load_forecast_df: pd.DataFrame,
+    wind_df: pd.DataFrame,
+    solar_df: pd.DataFrame,
+    start: str,
+    end: str,
 ) -> pd.DataFrame:
     """
-    Process system condition data into canonical schema.
+    Process load, wind, solar into canonical system_conditions table.
+
+    load_actual_df: from fetch_load_actual() — columns include Interval Start, ERCOT
+    load_forecast_df: from fetch_load_forecast() — columns include Interval Start, System Total, In Use Flag
+    wind_df: from fetch_wind() — columns include Interval Start, GEN SYSTEM WIDE, STWPF SYSTEM WIDE
+    solar_df: from fetch_solar() — columns include Interval Start, GEN SYSTEM WIDE, STPPF SYSTEM WIDE
     """
-    load = normalize_timestamp_index(load_df)
-    load_aligned = resample_to_5min(load)
+    idx = _make_5min_index(start, end)
+    result = pd.DataFrame(index=idx)
+    result.index.name = "timestamp_utc"
 
-    result = pd.DataFrame(index=load_aligned.index)
+    # --- Load actual (hourly → ffill) ---
+    if not load_actual_df.empty:
+        load = load_actual_df.copy()
+        load["ts_utc"] = _to_utc_index(load)
+        load = load.drop_duplicates(subset=["ts_utc"], keep="last")
+        load = load.set_index("ts_utc")
+        if "ERCOT" in load.columns:
+            result["total_load_mw"] = load["ERCOT"].reindex(idx).ffill()
+        logger.info(f"  Load actual: {result['total_load_mw'].notna().sum()} values")
+    else:
+        result["total_load_mw"] = np.nan
 
-    # Load data
-    total_load_col = _find_first_column(
-        load_aligned,
-        ["Load", "Total Load", "System Total", "Actual Load", "Demand"],
-    )
-    if total_load_col:
-        result["total_load_mw"] = load_aligned[total_load_col]
+    # --- Load forecast (hourly → ffill, filter to In Use Flag == True) ---
+    if not load_forecast_df.empty:
+        fcast = load_forecast_df.copy()
+        if "In Use Flag" in fcast.columns:
+            fcast = fcast[fcast["In Use Flag"] == True]
+        fcast["ts_utc"] = _to_utc_index(fcast)
+        if "Publish Time" in fcast.columns:
+            fcast = fcast.sort_values("Publish Time")
+        fcast = fcast.drop_duplicates(subset=["ts_utc"], keep="last")
+        fcast = fcast.set_index("ts_utc")
+        if "System Total" in fcast.columns:
+            result["load_forecast_mw"] = fcast["System Total"].reindex(idx).ffill()
+        logger.info(f"  Load forecast: {result.get('load_forecast_mw', pd.Series()).notna().sum()} values")
+    else:
+        result["load_forecast_mw"] = np.nan
 
-    forecast_col = _find_first_column(
-        load_aligned,
-        ["Forecast", "Load Forecast", "Forecast Load", "System Forecast"],
-    )
-    if forecast_col:
-        result["load_forecast_mw"] = load_aligned[forecast_col]
+    # --- Wind ---
+    if not wind_df.empty:
+        wind_actual, wind_fcast = _dedup_renewable(
+            wind_df, "GEN SYSTEM WIDE", "STWPF SYSTEM WIDE"
+        )
+        if not wind_actual.empty:
+            result["wind_actual_mw"] = wind_actual.reindex(idx).ffill()
+        else:
+            result["wind_actual_mw"] = np.nan
+        if not wind_fcast.empty:
+            result["wind_forecast_mw"] = wind_fcast.reindex(idx).ffill()
+        else:
+            result["wind_forecast_mw"] = np.nan
+        logger.info(f"  Wind: actual={result['wind_actual_mw'].notna().sum()}, forecast={result['wind_forecast_mw'].notna().sum()}")
+    else:
+        result["wind_actual_mw"] = np.nan
+        result["wind_forecast_mw"] = np.nan
 
-    # Wind/Solar
-    if wind_df is not None and not wind_df.empty:
-        wind = normalize_timestamp_index(wind_df)
-        wind_aligned = resample_to_5min(wind)
-        wind_col = _find_first_column(wind_aligned, ["Wind", "Actual", "Generation", "Output"])
-        if wind_col is None and len(wind_aligned.columns) > 0:
-            wind_col = wind_aligned.select_dtypes(include=[np.number]).columns[0]
-        if wind_col is not None:
-            result["wind_actual_mw"] = wind_aligned[wind_col]
+    # --- Solar ---
+    if not solar_df.empty:
+        solar_actual, solar_fcast = _dedup_renewable(
+            solar_df, "GEN SYSTEM WIDE", "STPPF SYSTEM WIDE"
+        )
+        if not solar_actual.empty:
+            result["solar_actual_mw"] = solar_actual.reindex(idx).ffill()
+        else:
+            result["solar_actual_mw"] = np.nan
+        if not solar_fcast.empty:
+            result["solar_forecast_mw"] = solar_fcast.reindex(idx).ffill()
+        else:
+            result["solar_forecast_mw"] = np.nan
+        logger.info(f"  Solar: actual={result['solar_actual_mw'].notna().sum()}, forecast={result['solar_forecast_mw'].notna().sum()}")
+    else:
+        result["solar_actual_mw"] = np.nan
+        result["solar_forecast_mw"] = np.nan
 
-    if solar_df is not None and not solar_df.empty:
-        solar = normalize_timestamp_index(solar_df)
-        solar_aligned = resample_to_5min(solar)
-        solar_col = _find_first_column(solar_aligned, ["Solar", "Actual", "Generation", "Output"])
-        if solar_col is None and len(solar_aligned.columns) > 0:
-            solar_col = solar_aligned.select_dtypes(include=[np.number]).columns[0]
-        if solar_col is not None:
-            result["solar_actual_mw"] = solar_aligned[solar_col]
-
-    # Derived: net load
-    if "total_load_mw" in result.columns:
-        wind_gen = result.get("wind_actual_mw", 0)
-        solar_gen = result.get("solar_actual_mw", 0)
+    # --- Derived: net load ---
+    wind_gen = result["wind_actual_mw"].fillna(0)
+    solar_gen = result["solar_actual_mw"].fillna(0)
+    if result["total_load_mw"].notna().any():
         result["net_load_mw"] = result["total_load_mw"] - wind_gen - solar_gen
+    else:
+        result["net_load_mw"] = np.nan
 
-    result = add_post_rtcb_flag(result)
+    result = _add_rtcb_flag(result)
     return result
 
 
-def validate_dataframe(
-    df: pd.DataFrame,
-    table_name: str,
-) -> dict:
-    """
-    Run quality checks on a processed DataFrame.
+# ──────────────────────────────────────────────
+# Validation
+# ──────────────────────────────────────────────
 
-    Returns a dict with validation results.
-    """
+def validate_dataframe(df: pd.DataFrame, table_name: str) -> dict:
+    """Run quality checks on a processed DataFrame."""
     checks = {
         "table": table_name,
         "rows": len(df),
-        "date_range": f"{df.index.min()} to {df.index.max()}" if len(df) > 0 else "empty",
         "columns": list(df.columns),
-        "null_fractions": df.isnull().mean().to_dict(),
-        "duplicated_timestamps": df.index.duplicated().sum(),
     }
 
-    # Check for gaps in 5-minute index
-    if len(df) > 1:
-        expected_intervals = pd.date_range(
-            df.index.min(), df.index.max(), freq="5min"
-        )
-        missing = expected_intervals.difference(df.index)
+    if len(df) > 0:
+        checks["date_range"] = f"{df.index.min()} → {df.index.max()}"
+        checks["null_counts"] = df.isnull().sum().to_dict()
+
+        # Check for gaps
+        expected = pd.date_range(df.index.min(), df.index.max(), freq="5min")
+        missing = expected.difference(df.index)
         checks["missing_intervals"] = len(missing)
-        checks["coverage_pct"] = (1 - len(missing) / len(expected_intervals)) * 100
+        checks["coverage_pct"] = (1 - len(missing) / max(len(expected), 1)) * 100
+
+        # Basic stats for numeric columns
+        numeric = df.select_dtypes(include=[np.number])
+        if not numeric.empty:
+            checks["stats"] = {
+                col: {
+                    "min": float(numeric[col].min()) if numeric[col].notna().any() else None,
+                    "max": float(numeric[col].max()) if numeric[col].notna().any() else None,
+                    "mean": float(numeric[col].mean()) if numeric[col].notna().any() else None,
+                }
+                for col in numeric.columns
+            }
     else:
+        checks["date_range"] = "empty"
         checks["missing_intervals"] = 0
         checks["coverage_pct"] = 0
 
     return checks
 
 
+# ──────────────────────────────────────────────
+# Parquet I/O
+# ──────────────────────────────────────────────
+
 def write_parquet(
     df: pd.DataFrame,
     output_dir: Path,
     table_name: str,
-    partition_by_month: bool = True,
 ):
-    """
-    Write processed DataFrame to Parquet files.
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Processed data with UTC DatetimeIndex.
-    output_dir : Path
-        Base output directory (e.g., data/processed/).
-    table_name : str
-        Table name (e.g., 'energy_prices').
-    partition_by_month : bool
-        If True, write separate files per month for efficient queries.
-    """
+    """Write processed DataFrame to monthly-partitioned Parquet files."""
     table_dir = output_dir / table_name
     table_dir.mkdir(parents=True, exist_ok=True)
 
-    if partition_by_month and len(df) > 0:
-        # Group by year-month and write separate files
-        df["_year_month"] = df.index.to_period("M").astype(str)
-        for ym, group in df.groupby("_year_month"):
-            group = group.drop(columns=["_year_month"])
-            path = table_dir / f"{ym}.parquet"
-            group.to_parquet(path, compression="snappy")
-            logger.info(f"Wrote {len(group)} rows to {path}")
-    else:
-        path = table_dir / f"{table_name}.parquet"
-        df.to_parquet(path, compression="snappy")
-        logger.info(f"Wrote {len(df)} rows to {path}")
+    if len(df) == 0:
+        logger.warning(f"Empty DataFrame for {table_name}, skipping write")
+        return
+
+    df["_year_month"] = df.index.to_period("M").astype(str)
+    for ym, group in df.groupby("_year_month"):
+        group = group.drop(columns=["_year_month"])
+        path = table_dir / f"{ym}.parquet"
+        group.to_parquet(path, compression="snappy")
+        logger.info(f"  Wrote {len(group)} rows → {path}")
+    df.drop(columns=["_year_month"], inplace=True)
 
 
 def read_parquet(
@@ -488,29 +400,11 @@ def read_parquet(
     start: str = None,
     end: str = None,
 ) -> pd.DataFrame:
-    """
-    Read processed Parquet files for a given table and date range.
-
-    Parameters
-    ----------
-    data_dir : Path
-        Base data directory (e.g., data/processed/).
-    table_name : str
-        Table name.
-    start, end : str, optional
-        Date range filter.
-
-    Returns
-    -------
-    pd.DataFrame
-        Combined data from matching Parquet files.
-    """
+    """Read processed Parquet files with optional date filtering."""
     table_dir = data_dir / table_name
-
     if not table_dir.exists():
-        raise FileNotFoundError(f"No data found at {table_dir}")
+        raise FileNotFoundError(f"No data at {table_dir}")
 
-    # Read all parquet files
     dfs = []
     for f in sorted(table_dir.glob("*.parquet")):
         dfs.append(pd.read_parquet(f))
@@ -519,14 +413,10 @@ def read_parquet(
         return pd.DataFrame()
 
     df = pd.concat(dfs).sort_index()
-
-    # Remove any duplicates
     df = df[~df.index.duplicated(keep="last")]
 
-    # Filter by date range
     if start:
         df = df[df.index >= pd.Timestamp(start, tz="UTC")]
     if end:
         df = df[df.index < pd.Timestamp(end, tz="UTC")]
-
     return df
