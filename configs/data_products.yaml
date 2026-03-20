@@ -1,0 +1,181 @@
+# ERCOT Data Products Configuration
+# Maps each data need to its ERCOT report ID, access method, and format details.
+
+# Key date: RTC+B went live December 5, 2025
+rtcb_go_live_date: "2025-12-05"
+
+# Data access tiers
+api:
+  base_url: "https://api.ercot.com"
+  explorer_url: "https://apiexplorer.ercot.com"
+  # API data availability starts ~Dec 11, 2023
+  api_data_start: "2023-12-11"
+  # Credentials stored in environment variables:
+  #   ERCOT_API_USERNAME, ERCOT_API_PASSWORD, ERCOT_API_SUBSCRIPTION_KEY
+
+# ──────────────────────────────────────────────
+# ENERGY PRICES
+# ──────────────────────────────────────────────
+energy_prices:
+  rt_spp:
+    description: "Real-Time Settlement Point Prices (15-min intervals)"
+    report_id: "NP6-905-CD"
+    granularity: "15min"
+    access: "api"              # gridstatus.ErcotAPI
+    available_from: "2010-12-01"
+    notes: "Settlement point prices at hub and load zone level"
+
+  rt_lmp:
+    description: "Real-Time LMPs by SCED Interval (5-min)"
+    report_id: "NP6-788-CD"
+    granularity: "5min"
+    access: "api"
+    available_from: "2010-12-01"
+    notes: "Nodal prices; use for 5-min granularity features"
+
+  dam_spp:
+    description: "Day-Ahead Settlement Point Prices (hourly)"
+    report_id: "NP4-190-CD"
+    granularity: "1hour"
+    access: "api"
+    available_from: "2010-12-01"
+
+# ──────────────────────────────────────────────
+# ANCILLARY SERVICE PRICES
+# ──────────────────────────────────────────────
+as_prices:
+  rt_mcpc:
+    description: "Real-Time Clearing Prices for Capacity (MCPCs) — NEW post-RTC+B"
+    report_id: "NP6-332-CD"
+    granularity: "5min"
+    access: "api"
+    available_from: "2025-12-05"  # Only exists post-RTC+B
+    products: ["REGUP", "REGDN", "RRS", "ECRS", "NSRS"]
+    notes: "This is the core new AS data product. Pre-RTC+B, RT AS prices did not exist."
+
+  dam_as:
+    description: "Day-Ahead AS Clearing Prices (hourly)"
+    report_id: "NP4-188-CD"
+    granularity: "1hour"
+    access: "api"
+    available_from: "2010-12-01"
+    products: ["REGUP", "REGDN", "RRS", "ECRS", "NSRS"]
+    notes: "Available for full historical period. Pre-RTC+B this was the ONLY AS price signal."
+
+  asdc_curves:
+    description: "Ancillary Service Demand Curves (replaced ORDC)"
+    report_ids:
+      dam: "NP4-212-CD"
+      sced: "NP4-212-CD"
+      hruc: "NP4-213-CD"
+      druc: "NP4-214-CD"
+      wruc: "NP4-215-CD"
+    granularity: "varies"
+    access: "api"
+    available_from: "2025-12-05"
+    notes: "ASDC parameters used by market clearing. Useful for understanding price formation."
+
+# ──────────────────────────────────────────────
+# SYSTEM CONDITIONS
+# ──────────────────────────────────────────────
+system_conditions:
+  load_forecast:
+    description: "7-Day Load Forecast by Weather Zone (hourly)"
+    report_id: "NP3-561-CD"
+    granularity: "1hour"
+    access: "api"
+
+  load_actual:
+    description: "Actual System Load (15-min)"
+    access: "gridstatus_scrape"  # Via gridstatus Ercot class
+    granularity: "15min"
+    notes: "Post-RTC+B: ESR charging load no longer included in real-time demand"
+
+  wind_solar_forecast:
+    description: "Wind/Solar Production Forecasts"
+    report_ids:
+      wind_hourly: "NP4-732-CD"
+      solar_hourly: "NP4-737-CD"
+    granularity: "1hour"
+    access: "api"
+
+  wind_solar_actual:
+    description: "Wind/Solar Actual Production (5-min)"
+    access: "gridstatus_scrape"
+    granularity: "5min"
+
+  fuel_mix:
+    description: "Generation by Fuel Type (15-min)"
+    access: "gridstatus_scrape"
+    granularity: "15min"
+
+# ──────────────────────────────────────────────
+# ESR / BATTERY DATA
+# ──────────────────────────────────────────────
+esr_data:
+  esr_aggregate_dashboard:
+    description: "Aggregate ESR charge/discharge/net (5-min)"
+    url: "https://www.ercot.com/gridmktinfo/dashboards/energystorageresources"
+    access: "gridstatus_scrape"
+    granularity: "5min"
+
+  esr_60day_disclosure:
+    description: "SCED ESR 60-Day Disclosure (unit-level SoC, limits, awards)"
+    access: "gridstatus_scrape"
+    available_from: "2025-12-05"
+    notes: "Rich unit-level data including SOC, max/min SOC, power limits, AS awards"
+
+  esr_name_mapping:
+    description: "Combo model to single-ESR name mapping"
+    url: "https://www.ercot.com/committees/tac/rtcbtf"
+    format: "xlsx"
+    notes: "Download manually from RTCBTF page. Maps old GR+CLR pairs to new ESR names."
+
+# ──────────────────────────────────────────────
+# MARKET NOTICES (for LLM Context Module — Week 11)
+# ──────────────────────────────────────────────
+notices:
+  market_notices_archive:
+    description: "3-year rolling archive of market notices"
+    url: "https://www.ercot.com/services/comm/mkt_notices/archives"
+    access: "web_scrape"
+    notes: "No API available. HTML pages, searchable by category/date/keyword."
+
+  operations_messages:
+    description: "Control room operations messages"
+    url: "https://www.ercot.com/services/comm/opsmessages"
+    access: "web_scrape"
+
+  txans_alerts:
+    description: "Weather watches, conservation notices, emergency alerts"
+    url: "https://www.ercot.com/txans"
+    access: "web_scrape"
+
+# ──────────────────────────────────────────────
+# TRAIN / VAL / TEST SPLITS
+# ──────────────────────────────────────────────
+splits:
+  train:
+    start: "2020-01-01"
+    end: "2023-12-31"
+    notes: "World model + forecasting training data"
+
+  validation:
+    start: "2024-01-01"
+    end: "2025-09-30"
+    notes: "Hyperparameter tuning and model selection"
+
+  test_pre_rtcb:
+    start: "2025-10-01"
+    end: "2025-12-04"
+    notes: "Pre-RTC+B test set (natural experiment control)"
+
+  test_post_rtcb:
+    start: "2025-12-05"
+    end: "2026-01-31"
+    notes: "Post-RTC+B test set (natural experiment treatment)"
+
+  test_ongoing:
+    start: "2026-02-01"
+    end: null
+    notes: "Ongoing out-of-sample evaluation"

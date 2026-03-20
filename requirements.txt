@@ -1,0 +1,34 @@
+# HybridBid - Week 1 Dependencies
+# Data access
+gridstatus>=0.34.0
+requests>=2.31.0
+
+# Data processing
+pandas>=2.1.0,<3.0
+numpy>=1.24.0
+pyarrow>=14.0.0
+duckdb>=0.9.0
+
+# Optimization
+cvxpy>=1.4.0
+highspy>=1.5.0          # HiGHS solver (open-source, default)
+# gurobipy>=11.0.0      # Uncomment once academic license is installed
+
+# Visualization
+matplotlib>=3.8.0
+seaborn>=0.13.0
+
+# Configuration
+pyyaml>=6.0
+
+# Notebooks
+jupyter>=1.0.0
+ipykernel>=6.0.0
+
+# Utilities
+tqdm>=4.66.0
+python-dateutil>=2.8.0
+pytz>=2023.3
+
+# Testing
+pytest>=7.4.0

@@ -1,0 +1,49 @@
+# Battery Parameters — Reference System (10 MW / 20 MWh)
+# These are the default parameters for backtesting.
+# The system should be tested across 5, 10, and 20 MW configurations.
+
+reference_battery:
+  name: "10MW_2hr_BESS"
+  power_max_mw: 10.0          # Maximum charge/discharge power [MW]
+  energy_max_mwh: 20.0        # Total energy capacity [MWh]
+  duration_hours: 2.0         # Energy / Power ratio
+
+  # State of Charge limits (fraction of energy_max)
+  soc_min_frac: 0.10          # Minimum SoC = 2 MWh
+  soc_max_frac: 0.90          # Maximum SoC = 18 MWh
+  soc_initial_frac: 0.50      # Starting SoC for each simulation day
+
+  # Efficiency
+  eta_charge: 0.92            # Round-trip: 0.92 * 0.92 = 0.846
+  eta_discharge: 0.92
+
+  # Degradation
+  degradation_cost_per_mwh: 2.0   # $/MWh throughput (cycle cost)
+
+  # Ramp rate
+  ramp_rate_mw_per_min: 10.0  # Can ramp full capacity in 1 minute (typical BESS)
+
+  # AS qualification (post-RTC+B)
+  as_qualified:
+    reg_up: true
+    reg_down: true
+    rrs: true
+    ecrs: true
+    nsrs: false               # Separate qualification required
+
+  # AS sustain durations (minutes) — for SoC reservation constraints
+  as_sustain_minutes:
+    reg_up: 60
+    reg_down: 60
+    rrs: 10
+    ecrs: 15
+    nsrs: 30
+
+# Scenario variants for sensitivity analysis (Week 12)
+scenarios:
+  small_5mw:
+    power_max_mw: 5.0
+    energy_max_mwh: 10.0
+  large_20mw:
+    power_max_mw: 20.0
+    energy_max_mwh: 40.0

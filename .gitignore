@@ -1,0 +1,32 @@
+# Data
+data/raw/
+data/processed/
+data/results/
+*.parquet
+
+# Environment
+.venv*/
+__pycache__/
+*.pyc
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Python packaging
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Gurobi
+gurobi.lic
