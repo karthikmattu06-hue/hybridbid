@@ -17,9 +17,14 @@ Credentials via environment variables:
 
 import logging
 import os
+import time
 from pathlib import Path
 
+from dotenv import load_dotenv
 import pandas as pd
+
+# Load .env from project root (no-op if vars already set)
+load_dotenv(Path(__file__).resolve().parent.parent.parent / ".env")
 
 logger = logging.getLogger(__name__)
 
@@ -42,8 +47,10 @@ def _get_api():
     except ImportError:
         raise ImportError("gridstatus>=0.35.0 required. Run: pip install gridstatus>=0.35.0")
 
-    _api_client = ErcotAPI(sleep_seconds=1.0, max_retries=5)
-    logger.info("ErcotAPI client initialized")
+    _api_client = ErcotAPI(sleep_seconds=2.0, max_retries=5)
+    # Pre-acquire auth token to avoid intermittent failures on first request
+    _api_client.get_token()
+    logger.info("ErcotAPI client initialized (token acquired)")
     return _api_client
 
 
@@ -126,6 +133,9 @@ def fetch_rt_lmp(start: str, end: str, location: str = "HB_HUBAVG") -> pd.DataFr
             logger.info(f"RT LMP {date_str}: got {len(df)} rows")
             _save_cache(df, "rt_lmp", date_str)
             all_frames.append(df)
+            # Rate limit protection between day requests
+            logger.debug(f"RT LMP: sleeping 2s before next day...")
+            time.sleep(2)
         except Exception as e:
             logger.warning(f"RT LMP {date_str}: fetch failed ({e}), skipping")
         current = next_day
@@ -336,7 +346,8 @@ def load_rt_mcpc(start: str, end: str) -> pd.DataFrame:
     Load RT SCED MCPCs from pre-downloaded Parquet files.
 
     Files expected at: data/raw/sced_mcpc/YYYY-MM-DD.parquet
-    Long format columns: SCEDTimestamp, RepeatedHourFlag, ASType, MCPC
+    Long format columns: sced_timestamp, repeated_hour_flag, as_type, mcpc
+    (sced_timestamp is datetime64[ns, UTC])
 
     Returns empty DataFrame if no files found (pre-RTC+B dates).
     """

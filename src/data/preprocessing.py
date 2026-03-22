@@ -146,20 +146,36 @@ def process_as_prices(
 
     # --- RT MCPC (5-min, long → pivot to wide) ---
     rt_cols = list(RT_MCPC_ASTYPE_MAP.values())
-    if not rt_mcpc_df.empty and "SCEDTimestamp" in rt_mcpc_df.columns:
+
+    # Detect column names: support both PascalCase (legacy) and lowercase (current files)
+    has_mcpc = not rt_mcpc_df.empty and (
+        "sced_timestamp" in rt_mcpc_df.columns or "SCEDTimestamp" in rt_mcpc_df.columns
+    )
+    if has_mcpc:
         rt = rt_mcpc_df.copy()
-        rt["SCEDTimestamp"] = pd.to_datetime(rt["SCEDTimestamp"], format="%m/%d/%Y %H:%M:%S")
-        # Localize to CPT then convert to UTC
-        rt["ts_utc"] = (
-            rt["SCEDTimestamp"]
-            .dt.tz_localize("US/Central", ambiguous="NaT", nonexistent="shift_forward")
-            .dt.tz_convert("UTC")
-        )
-        rt["ts_utc"] = _floor_5min(rt["ts_utc"])
+
+        # Normalize column names to lowercase
+        col_map = {
+            "SCEDTimestamp": "sced_timestamp",
+            "RepeatedHourFlag": "repeated_hour_flag",
+            "ASType": "as_type",
+            "MCPC": "mcpc",
+        }
+        rt.rename(columns={k: v for k, v in col_map.items() if k in rt.columns}, inplace=True)
+
+        # Convert timestamp to UTC
+        ts = pd.to_datetime(rt["sced_timestamp"])
+        if ts.dt.tz is None:
+            # Legacy string format: parse then localize to CPT → UTC
+            ts = ts.dt.tz_localize("US/Central", ambiguous="NaT", nonexistent="shift_forward")
+            ts = ts.dt.tz_convert("UTC")
+        else:
+            ts = ts.dt.tz_convert("UTC")
+        rt["ts_utc"] = _floor_5min(ts)
 
         # Pivot: one column per AS type
         pivoted = rt.pivot_table(
-            index="ts_utc", columns="ASType", values="MCPC", aggfunc="last"
+            index="ts_utc", columns="as_type", values="mcpc", aggfunc="last"
         )
         for as_type, dst_col in RT_MCPC_ASTYPE_MAP.items():
             if as_type in pivoted.columns:

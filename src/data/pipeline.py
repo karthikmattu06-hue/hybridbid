@@ -11,6 +11,7 @@ Usage:
 
 import argparse
 import logging
+import time
 from pathlib import Path
 
 import pandas as pd
@@ -35,6 +36,8 @@ def run_energy_prices(start: str, end: str) -> pd.DataFrame:
     logger.info(f"{'='*60}")
 
     rt_lmp = fetcher.fetch_rt_lmp(start, end)
+    logger.info("  Pausing 2s before next fetch...")
+    time.sleep(2)
     dam_spp = fetcher.fetch_dam_spp(start, end)
 
     df = pp.process_energy_prices(rt_lmp, dam_spp, start, end)
@@ -54,6 +57,8 @@ def run_as_prices(start: str, end: str) -> pd.DataFrame:
     logger.info(f"{'='*60}")
 
     dam_as = fetcher.fetch_dam_as(start, end)
+    logger.info("  Pausing 2s before next fetch...")
+    time.sleep(2)
     rt_mcpc = fetcher.load_rt_mcpc(start, end)
 
     df = pp.process_as_prices(dam_as, rt_mcpc, start, end)
@@ -73,8 +78,14 @@ def run_system_conditions(start: str, end: str) -> pd.DataFrame:
     logger.info(f"{'='*60}")
 
     load_actual = fetcher.fetch_load_actual(start, end)
+    logger.info("  Pausing 2s between system condition fetches...")
+    time.sleep(2)
     load_forecast = fetcher.fetch_load_forecast(start, end)
+    logger.info("  Pausing 2s between system condition fetches...")
+    time.sleep(2)
     wind = fetcher.fetch_wind(start, end)
+    logger.info("  Pausing 2s between system condition fetches...")
+    time.sleep(2)
     solar = fetcher.fetch_solar(start, end)
 
     df = pp.process_system_conditions(
@@ -108,11 +119,20 @@ def run_pipeline(start: str, end: str, tables: list[str] = None):
     DATA_PROCESSED.mkdir(parents=True, exist_ok=True)
 
     results = {}
+    fetched = 0
     if "energy_prices" in tables:
         results["energy_prices"] = run_energy_prices(start, end)
+        fetched += 1
     if "as_prices" in tables:
+        if fetched > 0:
+            logger.info("Pausing 10s between products (rate limit protection)...")
+            time.sleep(10)
         results["as_prices"] = run_as_prices(start, end)
+        fetched += 1
     if "system_conditions" in tables:
+        if fetched > 0:
+            logger.info("Pausing 10s between products (rate limit protection)...")
+            time.sleep(10)
         results["system_conditions"] = run_system_conditions(start, end)
 
     logger.info(f"\n{'='*60}")
