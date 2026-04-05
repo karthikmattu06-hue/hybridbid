@@ -2,7 +2,17 @@
 Hyperparameter configuration for TempDRL training.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+import torch
+
+
+def _detect_device() -> str:
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
 
 
 @dataclass
@@ -37,8 +47,8 @@ class TrainConfig:
     eta_dch: float = 0.92
     degradation_cost: float = 2.0
 
-    # Device
-    device: str = "cpu"
+    # Device — auto-detect CUDA > MPS > CPU
+    device: str = field(default_factory=_detect_device)
 
 
 @dataclass
@@ -56,8 +66,8 @@ class Stage1Config(TrainConfig):
     updates_per_step: int = 1
 
     # Data range
-    train_start: str = "2026-01-07"
-    train_end: str = "2026-01-12"
+    train_start: str = "2020-01-01"
+    train_end: str = "2023-12-31"
 
     # Checkpoint
     checkpoint_dir: str = "checkpoints/stage1"
@@ -83,8 +93,8 @@ class Stage2Config(TrainConfig):
     phase2_steps: int = 20_000  # Unfreeze top layers
 
     # Data range
-    train_start: str = "2026-01-07"
-    train_end: str = "2026-01-12"
+    train_start: str = "2025-12-05"
+    train_end: str = "2026-01-31"
 
     # Stage 1 checkpoint
     stage1_checkpoint: str = "checkpoints/stage1/checkpoint.pt"

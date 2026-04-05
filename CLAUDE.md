@@ -1,7 +1,7 @@
-# CLAUDE.md — TempDRL for ERCOT RTC+B (Revised)
-**Date:** March 24, 2026
+# CLAUDE.md — TempDRL for ERCOT RTC+B
+**Date:** April 5, 2026
 **Project:** Temporal-Aware Deep Reinforcement Learning for Battery Storage Bidding in ERCOT's Post-RTC+B Market
-**Status:** Pipeline validated, data backfill in progress → Begin TTFE + SAC implementation
+**Status:** All modules built and tested (62 tests passing) → Resolve data issues → Launch Stage 1 training
 
 ---
 
@@ -10,8 +10,9 @@
 1. **Work incrementally.** Do NOT attempt to build the full system at once. Build one module, test it, confirm, then proceed.
 2. **Two-stage training is the core architectural decision.** Do not mix pre-RTC+B and post-RTC+B data in training. Stage 1 uses pre-RTC+B only, Stage 2 uses post-RTC+B only.
 3. **Ask before building.** When encountering ambiguity, stop and report rather than guessing.
-4. **The old `HybridBid_Project_Handoff_v2.md` is OBSOLETE.** This CLAUDE.md is the single source of truth.
-5. **Era-aware features (is_post_rtcb, days_since_rtcb, rt_as_available) are REMOVED from the observation space.** The structural break is handled by the two-stage training schedule, not observation flags.
+4. **This CLAUDE.md is the single source of truth.** All prior handoff documents (`HybridBid_Project_Handoff_v2.md`, previous `CLAUDE.md` versions) are obsolete.
+5. **Era-aware features (is_post_rtcb, days_since_rtcb, rt_as_available) are REMOVED from the observation space.** The structural break is handled by the two-stage training schedule, not observation flags. The `is_post_rtcb` column may still exist in processed Parquet files — it must NOT be used as an input feature.
+6. **Explore and report first.** Surface findings before building. Never attempt to build the full system at once. Ask before proceeding on ambiguity.
 
 ---
 
@@ -41,6 +42,19 @@ This preserves the Li et al. architecture while respecting the structural break 
 
 ---
 
+## PRE-TRAINING CHECKLIST
+
+These issues must be resolved before launching Stage 1 training:
+
+- [ ] **`is_post_rtcb` column in processed data:** Confirm that `ercot_env.py` and training code do NOT use this column as an observation feature. It may remain in Parquet for data-splitting convenience, but must never enter the observation space.
+- [ ] **`load_forecast` raw data gap:** Raw files end at Nov 2024 (~16 months stale), but processed files cover the full range. Verify: did the pipeline fill this from another source, or is load_forecast data missing/zero-filled for Dec 2024–present?
+- [ ] **Wind/solar raw data:** Raw directories appear thin. Same question: verify processed wind/solar data is real, not zero-filled.
+- [ ] **Data transfer from Air:** `~/ercot_backfill/` does not exist on M4. The SCP transfer from MacBook Air (`karthikmattu@100.99.63.48`) has not happened. Transfer the backfill data, then re-run preprocessing to produce the final canonical dataset.
+- [ ] **Run baselines on test periods:** TBx and Perfect Foresight MIP are implemented but have not been run. Generate baseline results in `data/results/` before training so we have comparison targets.
+- [ ] **Commit and push:** 2 unpushed commits + uncommitted changes to CLAUDE.md and config.py. Clean up and push before starting training runs.
+
+---
+
 ## DATA STRATEGY
 
 ### Data Access (Confirmed via Exploration)
@@ -55,6 +69,19 @@ This preserves the Li et al. architecture while respecting the structural break 
 | Wind | ErcotAPI `get_wind_actual_and_forecast_hourly` | Hourly | 2020+ |
 | Solar | ErcotAPI `get_solar_actual_and_forecast_hourly` | Hourly | 2020+ |
 
+### Raw Data Status (as of April 5, 2026)
+| Directory | Files | Date Range | Notes |
+|-----------|-------|------------|-------|
+| dam_as | 2,274 | 2020-01-01 → 2026-03-23 | Current |
+| rt_lmp | 1,180 | 2020-01-01 → 2026-03-23 | Current |
+| rt_lmp_5min | 2,192 | 2020-01-01 → 2025-12-31 | Ends Dec 2025 |
+| dam_spp | 88 (yearly) | 2020 → 2026 | Current |
+| load_actual | 7 (yearly) | 2020 → 2026 | Current |
+| load_forecast | 1,793 | 2020-01-01 → 2024-11-27 | **STALE — 16 months behind** |
+| sced_mcpc | 109 | ~Dec 2025 → ~Mar 2026 | As expected |
+| rt_spp | 7 (yearly) | 2020 → 2025 | Missing 2026 |
+| solar, wind | Minimal | — | Likely stale |
+
 ### Canonical Schema (5-min intervals, UTC)
 Three Parquet tables partitioned by month. Hourly data forward-filled to 5-min. See `src/data/schema.py` for exact column mappings.
 
@@ -62,13 +89,15 @@ Three Parquet tables partitioned by month. Hourly data forward-filled to 5-min. 
 - **as_prices:** timestamp_utc, rt_mcpc_{regup,regdn,rrs,ecrs,nsrs} (zero pre-RTC+B), dam_as_{regup,regdn,rrs,ecrs,nsrs}
 - **system_conditions:** timestamp_utc, total_load_mw, load_forecast_mw, wind_actual_mw, wind_forecast_mw, solar_actual_mw, solar_forecast_mw, net_load_mw
 
+**Note:** Processed Parquet files contain an `is_post_rtcb` column. This is for data-splitting convenience ONLY — it must not be used as an observation feature.
+
 ---
 
 ## TEMPDRL ARCHITECTURE
 
 ### Observation Space (78 dimensions total)
 
-**TTFE Input** — Rolling window of L=32 price vectors, each 11-dim:
+**TTFE Input** — Rolling window of L=32 price vectors, each 12-dim:
 - RT LMP (1)
 - RT MCPC × 5: RegUp, RegDn, RRS, ECRS, NSRS (zeros pre-RTC+B)
 - DAM SPP (1)
@@ -132,7 +161,7 @@ Where:
 
 ### TTFE Architecture
 
-- Input: S_t = [ρ_{t-L+1}, ..., ρ_t] — shape (L=32, 11)
+- Input: S_t = [ρ_{t-L+1}, ..., ρ_t] — shape (L=32, 12)
 - Multi-Head Self-Attention: 4 heads
 - d_model: 64
 - n_layers: 2 transformer layers
@@ -223,11 +252,30 @@ Train until convergence:
 
 ---
 
-## BASELINES FOR COMPARISON
+## EVALUATION PLAN (Three Dimensions)
 
-1. **TBx (Time-Based Arbitrage):** Charge cheapest 4 hours, discharge most expensive 4 hours daily. No AS. Already implemented.
-2. **Energy-Only Perfect Foresight MIP:** CVXPY + HiGHS. Theoretical energy-only ceiling. Already implemented.
-3. **Predict-and-Optimize (P&O):** XGBoost forecast → MIP. Deferred — implement if time permits.
+### 1. Baseline Comparison
+Compare the trained two-stage agent against:
+- **TBx (Time-Based Arbitrage):** Charge cheapest 4 hours, discharge most expensive 4 hours daily. No AS. Already implemented in `src/baselines/tbx.py`.
+- **Perfect Foresight MIP:** CVXPY + HiGHS. Theoretical energy-only ceiling. Already implemented in `src/baselines/perfect_foresight.py`.
+- **Vanilla SAC (no TTFE):** Standard SAC with flat observation vector (no transformer temporal encoding). Tests the value of the TTFE component.
+
+### 2. Train-from-Scratch Comparison
+Train a fresh agent on post-RTC+B data only (no pretraining, no Stage 1 initialization) to test whether the two-stage approach is justified. This replaces the old "Stage 1 vs Stage 2 direct comparison."
+
+### 3. Ablation Study
+Test Stage 2 adaptation components in isolation:
+- Progressive unfreezing vs full fine-tune vs full freeze of TTFE
+- Fresh critics vs warm-started critics
+- Near-zero AS init vs random AS init
+
+### Explicitly Removed from Committed Evaluation
+These can be added back if results warrant, but are not committed deliverables:
+- Revenue decomposition (energy vs AS breakdown)
+- Consistency and risk metrics (daily returns, drawdowns)
+- Sample efficiency curve
+- TTFE attention weight visualization
+- Stage 1 vs Stage 2 representation analysis
 
 ---
 
@@ -241,55 +289,66 @@ hybridbid/
 ├── data/
 │   ├── raw/                      # Daily Parquet files per product
 │   │   ├── rt_lmp/
+│   │   ├── rt_lmp_5min/
 │   │   ├── dam_spp/
 │   │   ├── dam_as/
 │   │   ├── load_actual/
-│   │   ├── load_forecast/
-│   │   ├── wind/
-│   │   ├── solar/
-│   │   └── sced_mcpc/            # 107 daily files (Dec 5, 2025 – Mar 20, 2026)
-│   ├── processed/                # Canonical schema Parquet (5-min, UTC)
+│   │   ├── load_forecast/         # ⚠️ Stale — ends Nov 2024
+│   │   ├── wind/                  # ⚠️ Thin — verify processed data
+│   │   ├── solar/                 # ⚠️ Thin — verify processed data
+│   │   ├── sced_mcpc/             # 109 daily files (Dec 5, 2025 – Mar 2026)
+│   │   └── rt_spp/
+│   ├── processed/                 # Canonical schema Parquet (5-min, UTC)
+│   │   ├── energy_prices/         # 75 monthly files, ~8,928 rows/month
+│   │   ├── as_prices/             # 75 monthly files
+│   │   └── system_conditions/     # 75 monthly files
 │   └── results/
+│       └── eda/                   # EDA output only — no baseline results yet
 ├── src/
 │   ├── data/
-│   │   ├── pipeline.py           # Orchestrator with rate limiting
-│   │   ├── ercot_fetcher.py      # Confirmed access methods per product
-│   │   ├── schema.py             # Validated column mappings
-│   │   └── preprocessing.py      # Cleaning, alignment, resampling
+│   │   ├── pipeline.py            # Orchestrator with rate limiting
+│   │   ├── ercot_fetcher.py       # Confirmed access methods per product
+│   │   ├── schema.py              # Validated column mappings
+│   │   └── preprocessing.py       # Cleaning, alignment, resampling
 │   ├── baselines/
-│   │   ├── tbx.py
-│   │   ├── perfect_foresight.py
-│   │   └── run_baselines.py
+│   │   ├── tbx.py                 # Time-Based Arbitrage
+│   │   ├── perfect_foresight.py   # Perfect foresight MIP (CVXPY/HiGHS)
+│   │   └── run_baselines.py       # CLI runner
+│   ├── models/
+│   │   ├── ttfe.py                # Transformer Temporal Feature Extractor (L=32, d=64)
+│   │   ├── sac.py                 # SAC agent with two-stage architecture
+│   │   ├── networks.py            # Actor (squashed Gaussian) and TwinCritic
+│   │   ├── feasibility.py         # Differentiable feasibility projection
+│   │   └── replay_buffer.py       # Fixed-capacity replay buffer for dict observations
+│   ├── env/
+│   │   └── ercot_env.py           # Gymnasium env with energy_only / co_optimize modes
+│   ├── training/
+│   │   ├── train_stage1.py        # Stage 1 energy-only pretraining loop
+│   │   ├── train_stage2.py        # Stage 2 finetuning with progressive unfreezing
+│   │   └── config.py              # Hyperparameter configuration dataclass
 │   ├── evaluation/
-│   │   ├── metrics.py
-│   │   └── visualization.py
+│   │   ├── metrics.py             # Revenue, capture rate, compliance metrics
+│   │   └── visualization.py       # Publication-quality plots
 │   └── utils/
-│       ├── time_utils.py
-│       └── battery_sim.py        # 13 tests pass
+│       ├── time_utils.py          # ERCOT CPT/UTC time conversion
+│       └── battery_sim.py         # Battery state simulator (13 tests)
 ├── tests/
-│   └── test_battery_sim.py
-├── .env                          # ERCOT API credentials (gitignored)
+│   ├── test_battery_sim.py        # 13 tests
+│   ├── test_feasibility.py        # 14 tests
+│   ├── test_networks.py           # 6 tests
+│   ├── test_ttfe.py               # 5 tests
+│   ├── test_sac.py                # 8 tests
+│   ├── test_env.py                # 12 tests
+│   └── test_replay_buffer.py      # 4 tests
+├── checkpoints/                   # (untracked) — empty, no training runs yet
+├── scripts/                       # (untracked)
+├── .env                           # ERCOT API credentials (gitignored)
 ├── .gitignore
-├── requirements.txt
+├── requirements.txt               # Stale — lists ~15 packages, ~250+ installed
 └── README.md
 ```
 
-**To be added (Weeks 3-4):**
-```
-├── src/
-│   ├── models/
-│   │   ├── ttfe.py               # Transformer Temporal Feature Extractor
-│   │   ├── sac.py                # Soft Actor-Critic agent
-│   │   ├── networks.py           # Actor, Critic, shared architectures
-│   │   ├── feasibility.py        # Action feasibility projection
-│   │   └── replay_buffer.py      # Experience replay buffer
-│   ├── env/
-│   │   └── ercot_env.py          # Gymnasium env with energy_only / co_optimize modes
-│   └── training/
-│       ├── train_stage1.py       # Stage 1 pretraining loop
-│       ├── train_stage2.py       # Stage 2 finetuning with progressive unfreezing
-│       └── config.py             # Hyperparameter configuration
-```
+**All 62 tests passing** (as of April 5, 2026). No training runs have been executed yet.
 
 ---
 
@@ -306,28 +365,35 @@ hybridbid/
 
 ---
 
-## REVISED WEEK PLAN
+## WEEK PLAN
 
 ### Weeks 1-2: Data Pipeline + Baselines ✅
 - [x] Project scaffold
 - [x] Battery simulator (13 tests pass)
 - [x] Data exploration (Phase 1 + 1b)
 - [x] Pipeline rebuild with confirmed mappings
-- [x] MCPC data downloaded (107 days)
+- [x] MCPC data downloaded (109 days)
 - [x] Pipeline validated on Jan 6-12, 2026
 - [x] Git repo initialized
-- [ ] Full 2020-2026 backfill (in progress on Air)
-- [ ] Run baselines on test periods
+- [x] Processed Parquet files generated (75 months × 3 tables)
 
-### Weeks 3-4: TempDRL Implementation
-- [ ] Implement TTFE (transformer temporal feature extractor)
-- [ ] Implement SAC agent (networks, replay buffer)
-- [ ] Implement feasibility projection (Stage 1 simple + Stage 2 full)
-- [ ] Build Gymnasium environment (energy_only + co_optimize modes)
-- [ ] Implement Stage 1 training loop
-- [ ] Implement Stage 2 training loop with progressive unfreezing
+### Weeks 3-4: TempDRL Implementation ✅
+- [x] Implement TTFE (transformer temporal feature extractor) — 5 tests
+- [x] Implement SAC agent (networks, replay buffer) — 8 + 6 + 4 tests
+- [x] Implement feasibility projection (Stage 1 simple + Stage 2 full) — 14 tests
+- [x] Build Gymnasium environment (energy_only + co_optimize modes) — 12 tests
+- [x] Implement Stage 1 training loop
+- [x] Implement Stage 2 training loop with progressive unfreezing
 - [ ] Verify Stage 1 trains end-to-end on small data slice
 - [ ] **Go/No-Go:** Stage 1 loss curves decreasing, policy beats random
+
+### Current Phase: Pre-Training Validation
+- [ ] Resolve pre-training checklist (see above)
+- [ ] Transfer backfill data from Air to M4
+- [ ] Re-preprocess with complete raw data
+- [ ] Run baselines on test periods (TBx + MIP)
+- [ ] Verify Stage 1 end-to-end on small data slice
+- [ ] Commit, push, clean up git state
 
 ### Weeks 5-6: Training + Evaluation
 - [ ] Stage 1 full training on 2020-2023 data
@@ -335,15 +401,15 @@ hybridbid/
 - [ ] Stage 2 Phase 1: frozen encoder warm-up
 - [ ] Stage 2 Phase 2: partial unfreeze
 - [ ] Stage 2 Phase 3 (if needed): full unfreeze
-- [ ] Evaluate on test sets, compare against baselines
-- [ ] **Go/No-Go:** Stage 2 agent outperforms TBx baseline
+- [ ] Run baselines on post-RTC+B test period
+- [ ] Train-from-scratch agent on post-RTC+B data
+- [ ] Run ablation study on Stage 2 components
+- [ ] **Go/No-Go:** Two-stage agent outperforms TBx baseline AND train-from-scratch
 
 ### Weeks 7-8: Analysis + Write-up
-- [ ] TTFE attention weight visualization
-- [ ] Stage 1 vs Stage 2 representation analysis
-- [ ] Revenue decomposition (energy vs each AS product)
-- [ ] Sensitivity analysis across battery configurations
+- [ ] Compare across all three evaluation dimensions
 - [ ] Draft results section and figures
+- [ ] Sensitivity analysis across battery configurations (if time permits)
 
 ---
 
@@ -357,6 +423,10 @@ hybridbid/
 - Meta-controller / hybrid routing
 - Predict-and-Optimize benchmark (implement if time permits)
 - Era-aware features (replaced by two-stage training)
+- Revenue decomposition analysis (can add back if results warrant)
+- Consistency/risk metrics (can add back if results warrant)
+- Sample efficiency curve (can add back if results warrant)
+- TTFE attention weight visualization (can add back if results warrant)
 
 ---
 

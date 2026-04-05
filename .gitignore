@@ -4,6 +4,12 @@ data/processed/
 data/results/
 *.parquet
 
+# Training artifacts
+checkpoints/
+
+# Ad-hoc scripts
+scripts/
+
 # Environment
 .venv*/
 __pycache__/

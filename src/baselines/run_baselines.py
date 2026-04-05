@@ -49,9 +49,9 @@ def load_prices(start: str, end: str) -> pd.Series:
             "Run the data pipeline first: python -m src.data.pipeline"
         )
 
-    # Use hub average SPP as the primary price signal
+    # Use RT LMP as the primary price signal, fall back to DAM SPP
     price_col = None
-    for col in ["rt_spp_hub", "dam_spp_hub"]:
+    for col in ["rt_lmp", "dam_spp"]:
         if col in df.columns and df[col].notna().any():
             price_col = col
             break
