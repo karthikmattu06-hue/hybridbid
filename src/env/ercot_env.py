@@ -69,6 +69,9 @@ class ERCOTBatteryEnv(gym.Env):
         battery_config: Optional[dict] = None,
         seq_len: int = SEQ_LEN,
         date_range: Optional[tuple] = None,
+        randomize_initial_soc: bool = False,
+        ema_tau: float = 0.95,
+        beta_arb: float = 0.5,
     ):
         """
         Parameters
@@ -83,10 +86,16 @@ class ERCOTBatteryEnv(gym.Env):
             TTFE lookback window length.
         date_range : tuple of (start_date, end_date) strings, optional
             Filter data to this date range.
+        randomize_initial_soc : bool
+            If True, randomize SoC at episode start between 20% and 80%.
         """
         super().__init__()
         assert mode in ("energy_only", "co_optimize")
         self.mode = mode
+        self.randomize_initial_soc = randomize_initial_soc
+        self.ema_tau = ema_tau
+        self.beta_arb = beta_arb
+        self.ema_price = 0.0
         self.seq_len = seq_len
 
         # Battery config
@@ -248,10 +257,17 @@ class ERCOTBatteryEnv(gym.Env):
 
         self.current_day_idx = self.current_day_idx % len(self.day_starts)
         self.current_step = 0
-        self.soc = self.soc_initial_frac * self.e_max
+        if self.randomize_initial_soc:
+            frac = self.np_random.uniform(0.20, 0.80)
+            self.soc = frac * self.e_max
+        else:
+            self.soc = self.soc_initial_frac * self.e_max
 
         # Set data index to start of this day
         self._day_start_idx = self.day_starts[self.current_day_idx]
+
+        # Initialize EMA with first RT LMP of the day
+        self.ema_price = float(self.price_data[self._day_start_idx, 0])
 
         obs = self._get_observation(self._day_start_idx)
 
@@ -310,11 +326,25 @@ class ERCOTBatteryEnv(gym.Env):
             as_rev = 0.0
             throughput = abs(p_net_proj) * dt
             deg_cost = self.degradation_cost * throughput
-            reward = energy_rev - deg_cost
+
+            # EMA arbitrage bonus (Li et al. Eq 24-26)
+            self.ema_price = self.ema_tau * self.ema_price + (1 - self.ema_tau) * rt_lmp
+            price_diff = abs(rt_lmp - self.ema_price)
+            if p_net_proj > 0 and rt_lmp > self.ema_price:
+                # Discharging when price above EMA — good
+                arbitrage_bonus = self.beta_arb * p_net_proj * price_diff * dt
+            elif p_net_proj < 0 and rt_lmp < self.ema_price:
+                # Charging when price below EMA — good
+                arbitrage_bonus = self.beta_arb * abs(p_net_proj) * price_diff * dt
+            else:
+                arbitrage_bonus = 0.0
+
+            reward = energy_rev + arbitrage_bonus - deg_cost
 
             info = {
                 "energy_revenue": energy_rev,
                 "as_revenue": 0.0,
+                "arbitrage_bonus": arbitrage_bonus,
                 "degradation_cost": deg_cost,
                 "soc": self.soc,
                 "p_net": p_net_proj,
@@ -360,11 +390,23 @@ class ERCOTBatteryEnv(gym.Env):
 
             throughput = abs(p_net_proj) * dt
             deg_cost = self.degradation_cost * throughput
-            reward = energy_rev + as_rev - deg_cost
+
+            # EMA arbitrage bonus (Li et al. Eq 24-26)
+            self.ema_price = self.ema_tau * self.ema_price + (1 - self.ema_tau) * rt_lmp
+            price_diff = abs(rt_lmp - self.ema_price)
+            if p_net_proj > 0 and rt_lmp > self.ema_price:
+                arbitrage_bonus = self.beta_arb * p_net_proj * price_diff * dt
+            elif p_net_proj < 0 and rt_lmp < self.ema_price:
+                arbitrage_bonus = self.beta_arb * abs(p_net_proj) * price_diff * dt
+            else:
+                arbitrage_bonus = 0.0
+
+            reward = energy_rev + as_rev + arbitrage_bonus - deg_cost
 
             info = {
                 "energy_revenue": energy_rev,
                 "as_revenue": as_rev,
+                "arbitrage_bonus": arbitrage_bonus,
                 "degradation_cost": deg_cost,
                 "soc": self.soc,
                 "p_net": p_net_proj,
@@ -372,18 +414,18 @@ class ERCOTBatteryEnv(gym.Env):
                 "projected_action": projected_action,
             }
 
-        # Clamp SoC (safety)
+        # Clamp SoC (safety — feasibility projection is the primary constraint)
         self.soc = np.clip(self.soc, self.soc_min, self.soc_max)
 
         # Advance step
         self.current_step += 1
 
-        # Check episode end (288 steps = 1 day)
-        terminated = self.current_step >= STEPS_PER_DAY
-        truncated = False
+        # Episode ends at day boundary only (288 steps = 1 full day)
+        terminated = False
+        truncated = self.current_step >= STEPS_PER_DAY
 
         # Build next observation
-        if not terminated:
+        if not truncated:
             next_data_idx = self._day_start_idx + self.current_step
             obs = self._get_observation(next_data_idx)
         else:

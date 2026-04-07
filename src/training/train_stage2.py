@@ -38,6 +38,7 @@ def train_stage2(config: Stage2Config = None):
         battery_config=battery_config,
         seq_len=config.seq_len,
         date_range=(config.train_start, config.train_end),
+        randomize_initial_soc=config.randomize_initial_soc,
     )
 
     # Create SAC agent

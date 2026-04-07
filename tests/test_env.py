@@ -72,13 +72,11 @@ class TestFullEpisode:
             obs, reward, terminated, truncated, info = env.step(action)
             total_reward += reward
             socs.append(info["soc"])
+            assert not terminated  # episodes never terminate early
 
-            if step < 287:
-                assert not terminated
-            else:
-                assert terminated
+        assert truncated  # episode ends via truncation at day boundary
 
-        # SoC should stay within bounds
+        # SoC should stay within bounds (feasibility projection)
         socs = np.array(socs)
         soc_min = env.soc_min_frac * env.e_max
         soc_max = env.soc_max_frac * env.e_max
@@ -92,8 +90,9 @@ class TestFullEpisode:
         for step in range(288):
             action = env.action_space.sample()
             obs, reward, terminated, truncated, info = env.step(action)
+            assert not terminated
 
-        assert terminated
+        assert truncated
 
 
 class TestRewardNonZero:
@@ -106,6 +105,14 @@ class TestRewardNonZero:
         # With non-zero LMP and non-zero action, reward should be non-zero
         # (degradation cost alone makes it non-zero)
         assert reward != 0.0 or info["p_net"] == 0.0
+
+    def test_arbitrage_bonus_in_info(self):
+        env = _make_env("energy_only")
+        obs, _ = env.reset()
+        action = np.array([0.5], dtype=np.float32)
+        _, _, _, _, info = env.step(action)
+        assert "arbitrage_bonus" in info
+        assert isinstance(info["arbitrage_bonus"], float)
 
 
 class TestMCPCColumns:

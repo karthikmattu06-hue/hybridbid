@@ -37,6 +37,13 @@ class TrainConfig:
     gamma: float = 0.99
     tau: float = 0.005
 
+    # Numerical stability
+    max_grad_norm: float = 1.0
+    reward_scale: float = 0.01    # divide raw rewards by ~100
+    price_scale: float = 100.0    # divide raw prices before TTFE
+    alpha_min: float = 0.01       # floor on entropy coefficient
+    randomize_initial_soc: bool = False  # randomize SoC at episode start (20%-80%)
+
     # Battery
     p_max: float = 10.0
     e_max: float = 20.0
@@ -55,6 +62,8 @@ class TrainConfig:
 class Stage1Config(TrainConfig):
     """Stage 1: Energy-only pretraining."""
 
+    randomize_initial_soc: bool = False  # paper uses fixed initial SoC
+
     # Training
     lr_actor: float = 3e-4
     lr_critic: float = 3e-4
@@ -69,7 +78,8 @@ class Stage1Config(TrainConfig):
     train_start: str = "2020-01-01"
     train_end: str = "2023-12-31"
 
-    # Checkpoint
+    # Logging / Checkpoint
+    log_interval: int = 1_000
     checkpoint_dir: str = "checkpoints/stage1"
     save_every: int = 50_000
 

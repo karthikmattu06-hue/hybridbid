@@ -53,13 +53,22 @@ class SACAgent:
         tau: float = 0.005,
         buffer_capacity: int = None,
         batch_size: int = None,
+        max_grad_norm: float = 1.0,
+        reward_scale: float = 1.0,
+        price_scale: float = 1.0,
+        alpha_min: float = 0.0,
     ):
         self.stage = stage
         self.device = device
         self.gamma = gamma
         self.tau = tau
+        self.max_grad_norm = max_grad_norm
+        self.reward_scale = reward_scale
+        self.price_scale = price_scale
+        self.alpha_min = alpha_min
         self.action_dim = 1 if stage == 1 else 6
-        self.obs_dim = d_model + static_dim  # 64 + 14 = 78
+        self.n_prices = n_prices
+        self.obs_dim = d_model + n_prices + static_dim  # 64 + 12 + 14 = 90
 
         # Default buffer/batch sizes per stage
         if buffer_capacity is None:
@@ -102,12 +111,15 @@ class SACAgent:
 
     @property
     def alpha(self):
-        return self.log_alpha.exp().detach()
+        return torch.clamp(self.log_alpha.exp(), min=self.alpha_min).detach()
 
     def _encode_obs(self, price_history: torch.Tensor, static_features: torch.Tensor) -> torch.Tensor:
-        """Run TTFE on price history and concatenate with static features."""
+        """Run TTFE on price history and concatenate with current prices + static features."""
+        if self.price_scale != 1.0:
+            price_history = price_history / self.price_scale
         temporal = self.ttfe(price_history)  # (batch, d_model)
-        return torch.cat([temporal, static_features], dim=-1)  # (batch, obs_dim)
+        current_prices = price_history[:, -1, :]  # (batch, n_prices) — already scaled
+        return torch.cat([temporal, current_prices, static_features], dim=-1)  # (batch, obs_dim)
 
     @torch.no_grad()
     def select_action(self, obs: dict, deterministic: bool = False) -> np.ndarray:
@@ -161,6 +173,10 @@ class SACAgent:
         next_sf = batch["next_static_features"]
         dones = batch["dones"]
 
+        # Scale rewards for numerical stability
+        if self.reward_scale != 1.0:
+            rewards = rewards * self.reward_scale
+
         # Encode observations
         obs_encoded = self._encode_obs(ph, sf)
         with torch.no_grad():
@@ -178,6 +194,9 @@ class SACAgent:
 
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
+        critic_grad_norm = nn.utils.clip_grad_norm_(
+            self.critic.parameters(), self.max_grad_norm
+        )
         self.critic_optimizer.step()
 
         # --- Actor update ---
@@ -188,6 +207,9 @@ class SACAgent:
 
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
+        actor_grad_norm = nn.utils.clip_grad_norm_(
+            self.actor.parameters(), self.max_grad_norm
+        )
         self.actor_optimizer.step()
 
         # --- TTFE update (via critic gradients) ---
@@ -198,6 +220,9 @@ class SACAgent:
 
         self.ttfe_optimizer.zero_grad()
         ttfe_loss.backward()
+        ttfe_grad_norm = nn.utils.clip_grad_norm_(
+            self.ttfe.parameters(), self.max_grad_norm
+        )
         self.ttfe_optimizer.step()
 
         # --- Alpha update ---
@@ -216,6 +241,9 @@ class SACAgent:
             "alpha_loss": alpha_loss.item(),
             "alpha": self.alpha.item(),
             "q_mean": q_new.mean().item(),
+            "critic_grad_norm": critic_grad_norm.item(),
+            "actor_grad_norm": actor_grad_norm.item(),
+            "ttfe_grad_norm": ttfe_grad_norm.item(),
         }
 
     def _soft_update(self):

@@ -7,40 +7,40 @@ from src.models.networks import Actor, TwinCritic
 
 @pytest.fixture
 def actor_1d():
-    return Actor(obs_dim=78, action_dim=1)
+    return Actor(obs_dim=90, action_dim=1)
 
 
 @pytest.fixture
 def actor_6d():
-    return Actor(obs_dim=78, action_dim=6)
+    return Actor(obs_dim=90, action_dim=6)
 
 
 @pytest.fixture
 def twin_critic_1d():
-    return TwinCritic(obs_dim=78, action_dim=1)
+    return TwinCritic(obs_dim=90, action_dim=1)
 
 
 @pytest.fixture
 def twin_critic_6d():
-    return TwinCritic(obs_dim=78, action_dim=6)
+    return TwinCritic(obs_dim=90, action_dim=6)
 
 
 def test_actor_forward_1d(actor_1d):
-    obs = torch.randn(8, 78)
+    obs = torch.randn(8, 90)
     mean, log_std = actor_1d(obs)
     assert mean.shape == (8, 1)
     assert log_std.shape == (8, 1)
 
 
 def test_actor_forward_6d(actor_6d):
-    obs = torch.randn(8, 78)
+    obs = torch.randn(8, 90)
     mean, log_std = actor_6d(obs)
     assert mean.shape == (8, 6)
     assert log_std.shape == (8, 6)
 
 
 def test_critic_forward_1d(twin_critic_1d):
-    obs = torch.randn(8, 78)
+    obs = torch.randn(8, 90)
     action = torch.randn(8, 1)
     q1, q2 = twin_critic_1d(obs, action)
     assert q1.shape == (8, 1)
@@ -48,7 +48,7 @@ def test_critic_forward_1d(twin_critic_1d):
 
 
 def test_critic_forward_6d(twin_critic_6d):
-    obs = torch.randn(8, 78)
+    obs = torch.randn(8, 90)
     action = torch.randn(8, 6)
     q1, q2 = twin_critic_6d(obs, action)
     assert q1.shape == (8, 1)
@@ -57,7 +57,7 @@ def test_critic_forward_6d(twin_critic_6d):
 
 def test_stage2_init_from_stage1(actor_1d):
     # Run a forward pass to populate weights
-    obs = torch.randn(4, 78)
+    obs = torch.randn(4, 90)
     actor_1d(obs)
 
     actor_6d = Actor.init_stage2_from_stage1(actor_1d, action_dim=6)
@@ -85,7 +85,7 @@ def test_stage2_init_from_stage1(actor_1d):
 
 
 def test_action_sampling(actor_1d, actor_6d):
-    obs = torch.randn(8, 78)
+    obs = torch.randn(8, 90)
 
     # 1D sampling
     action, log_prob, det_action = actor_1d.sample(obs)

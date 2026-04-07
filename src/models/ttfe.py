@@ -70,5 +70,5 @@ class TTFE(nn.Module):
         # Transformer encoder
         h = self.transformer(h)  # (batch, seq_len, d_model)
 
-        # Take last timestep as output
-        return h[:, -1, :]  # (batch, d_model)
+        # Global average pooling along temporal dimension (Li et al. Eq 21)
+        return h.mean(dim=1)  # (batch, d_model)

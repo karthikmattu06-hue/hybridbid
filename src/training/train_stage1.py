@@ -1,11 +1,14 @@
 """
 Stage 1: Energy-only pretraining on pre-RTC+B data.
 
-Minimal working stub — runs end-to-end on a tiny data slice to verify the loop.
+Full training loop with logging, checkpointing, and numerical stability.
 """
 
+import argparse
 import os
 import sys
+import time
+
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
@@ -22,6 +25,11 @@ def train_stage1(config: Stage1Config = None):
     print(f"=== Stage 1: Energy-Only Training ===")
     print(f"Data: {config.train_start} to {config.train_end}")
     print(f"Device: {config.device}")
+    print(f"Total steps: {config.total_steps}")
+    print(f"Reward scale: {config.reward_scale}")
+    print(f"Price scale: {config.price_scale}")
+    print(f"Max grad norm: {config.max_grad_norm}")
+    print(f"Alpha min: {config.alpha_min}")
 
     # Create environment
     battery_config = dict(
@@ -37,6 +45,7 @@ def train_stage1(config: Stage1Config = None):
         battery_config=battery_config,
         seq_len=config.seq_len,
         date_range=(config.train_start, config.train_end),
+        randomize_initial_soc=config.randomize_initial_soc,
     )
 
     # Create SAC agent
@@ -57,6 +66,10 @@ def train_stage1(config: Stage1Config = None):
         tau=config.tau,
         buffer_capacity=config.buffer_capacity,
         batch_size=config.batch_size,
+        max_grad_norm=config.max_grad_norm,
+        reward_scale=config.reward_scale,
+        price_scale=config.price_scale,
+        alpha_min=config.alpha_min,
     )
 
     # Training loop
@@ -64,55 +77,124 @@ def train_stage1(config: Stage1Config = None):
     episode_reward = 0.0
     episode_count = 0
     step = 0
-    metrics_history = []
+    log_interval = config.log_interval
+    save_interval = config.save_every
+    t_start = time.time()
 
-    total_steps = min(config.total_steps, 1000)  # Cap for stub
-    print(f"Running {total_steps} steps...")
+    # Rolling metrics for logging
+    recent_rewards = []
+    recent_socs = []
 
-    while step < total_steps:
+    os.makedirs(config.checkpoint_dir, exist_ok=True)
+
+    print(f"Warming up for {config.warmup_steps} steps...")
+
+    while step < config.total_steps:
         # Select action
         action = agent.select_action(obs)
 
         # Step environment
         next_obs, reward, terminated, truncated, info = env.step(action)
         episode_reward += reward
+        recent_socs.append(info["soc"])
 
-        # Store transition
+        # Store transition (done=True only on true termination, not truncation)
         agent.buffer.add(obs, action, reward, next_obs, terminated)
 
         # Update agent
+        metrics = {}
         if step >= config.warmup_steps:
             metrics = agent.update()
-            if metrics and step % 100 == 0:
-                metrics_history.append(metrics)
-                print(f"  Step {step}: critic_loss={metrics['critic_loss']:.4f}, "
-                      f"actor_loss={metrics['actor_loss']:.4f}, "
-                      f"alpha={metrics['alpha']:.4f}, "
-                      f"SoC={info['soc']:.2f}")
 
         obs = next_obs
         step += 1
 
-        if terminated:
+        if terminated or truncated:
             episode_count += 1
-            print(f"  Episode {episode_count} reward: {episode_reward:.2f}")
+            recent_rewards.append(episode_reward)
             episode_reward = 0.0
             obs, _ = env.reset()
 
-    # Save checkpoint
-    os.makedirs(config.checkpoint_dir, exist_ok=True)
-    ckpt_path = os.path.join(config.checkpoint_dir, "checkpoint.pt")
-    agent.save_checkpoint(ckpt_path)
-    print(f"Checkpoint saved to {ckpt_path}")
+        # Logging
+        if step % log_interval == 0 and metrics:
+            elapsed = time.time() - t_start
+            steps_per_sec = step / elapsed if elapsed > 0 else 0
+            avg_reward = np.mean(recent_rewards[-10:]) if recent_rewards else 0
+            avg_soc = np.mean(recent_socs[-288:]) if recent_socs else 0
 
-    # Print summary
-    if metrics_history:
-        final = metrics_history[-1]
-        print(f"\nFinal metrics: critic_loss={final['critic_loss']:.4f}, "
-              f"actor_loss={final['actor_loss']:.4f}")
+            # Check for NaN
+            has_nan = any(
+                np.isnan(v) for v in metrics.values() if isinstance(v, float)
+            )
+            nan_flag = " *** NaN DETECTED ***" if has_nan else ""
 
-    return agent, metrics_history
+            print(
+                f"Step {step:>7d}/{config.total_steps} | "
+                f"ep={episode_count} | "
+                f"critic={metrics.get('critic_loss', 0):.4f} | "
+                f"actor={metrics.get('actor_loss', 0):.4f} | "
+                f"alpha={metrics.get('alpha', 0):.4f} | "
+                f"avg_reward={avg_reward:.1f} | "
+                f"avg_soc={avg_soc:.2f} | "
+                f"grad_c={metrics.get('critic_grad_norm', 0):.3f} | "
+                f"grad_a={metrics.get('actor_grad_norm', 0):.3f} | "
+                f"grad_t={metrics.get('ttfe_grad_norm', 0):.3f} | "
+                f"{steps_per_sec:.1f} steps/s{nan_flag}",
+                flush=True,
+            )
+
+            if has_nan:
+                print("FATAL: NaN detected in metrics. Saving emergency checkpoint and stopping.")
+                emergency_path = os.path.join(config.checkpoint_dir, f"emergency_step{step}.pt")
+                agent.save_checkpoint(emergency_path)
+                return agent, []
+
+            # Clear old SoC history to avoid memory growth
+            if len(recent_socs) > 1000:
+                recent_socs = recent_socs[-500:]
+
+        # Checkpointing
+        if step % save_interval == 0:
+            ckpt_path = os.path.join(config.checkpoint_dir, f"checkpoint_step{step}.pt")
+            agent.save_checkpoint(ckpt_path)
+            print(f"  Checkpoint saved: {ckpt_path}", flush=True)
+
+    # Final checkpoint
+    final_path = os.path.join(config.checkpoint_dir, "checkpoint_final.pt")
+    agent.save_checkpoint(final_path)
+
+    elapsed = time.time() - t_start
+    print(f"\n=== Training Complete ===")
+    print(f"Total steps: {step}")
+    print(f"Episodes: {episode_count}")
+    print(f"Time: {elapsed/3600:.2f} hours")
+    print(f"Final checkpoint: {final_path}")
+
+    if recent_rewards:
+        print(f"Last 10 episode avg reward: {np.mean(recent_rewards[-10:]):.2f}")
+
+    return agent, recent_rewards
 
 
 if __name__ == "__main__":
-    train_stage1()
+    parser = argparse.ArgumentParser(description="Stage 1 Training")
+    parser.add_argument("--steps", type=int, default=None, help="Override total_steps")
+    parser.add_argument("--start", type=str, default=None, help="Override train_start date")
+    parser.add_argument("--end", type=str, default=None, help="Override train_end date")
+    parser.add_argument("--device", type=str, default=None, help="Override device")
+    parser.add_argument("--log-interval", type=int, default=None, help="Override log interval")
+    args = parser.parse_args()
+
+    config = Stage1Config()
+    if args.steps is not None:
+        config.total_steps = args.steps
+    if args.start is not None:
+        config.train_start = args.start
+    if args.end is not None:
+        config.train_end = args.end
+    if args.device is not None:
+        config.device = args.device
+    if args.log_interval is not None:
+        config.log_interval = args.log_interval
+
+    train_stage1(config)
