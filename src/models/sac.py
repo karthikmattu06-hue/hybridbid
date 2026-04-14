@@ -205,10 +205,11 @@ class SACAgent:
         dones = batch["dones"]
 
         # Clip per-step rewards to prevent ERCOT price spikes (e.g. Feb 2021 storm,
-        # $9000/MWh × β_S=10) from driving Q-values to ~68k and causing critic
-        # weight explosion. Normal arbitrage yields $0-10/step so no signal is lost.
-        # Q* cap ≈ 50/0.01 = 5000, keeping critic weights bounded.
-        rewards = rewards.clamp(-50.0, 50.0)
+        # $9000/MWh × β_S=10 → reward ~7800) from causing critic weight explosion.
+        # ±1000 preserves the full signal for 99%+ of ERCOT intervals (normal range
+        # $20–$2,000/MWh) while bounding Uri-scale extremes.
+        # Q* cap ≈ 1000/0.01 = 100k, still bounded.
+        rewards = rewards.clamp(-1000.0, 1000.0)
 
         # Encode observations
         obs_encoded = self._encode_obs(ph, sf)
