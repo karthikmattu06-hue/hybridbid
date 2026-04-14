@@ -132,10 +132,16 @@ class SACAgent:
     def alpha(self):
         return self.log_alpha.exp().detach()
 
+    # Scale factor for raw ERCOT prices ($/MWh). Dividing keeps attention Q/K
+    # dot products from overflowing float32 during storm events ($9000+/MWh).
+    # Normal trading is $20-200 → 0.02-0.2 after scaling; storms → 9.0 max.
+    PRICE_NORM = 1000.0
+
     def _encode_obs(self, price_history: torch.Tensor, static_features: torch.Tensor) -> torch.Tensor:
         """Run TTFE on price history and concatenate with current prices + static features."""
-        temporal = self.ttfe(price_history)                 # (batch, d_model)
-        current_prices = price_history[:, -1, :]            # (batch, n_prices)
+        ph_norm = price_history / self.PRICE_NORM            # scale $/MWh → ~[0, 9]
+        temporal = self.ttfe(ph_norm)                        # (batch, d_model)
+        current_prices = ph_norm[:, -1, :]                   # (batch, n_prices)
         return torch.cat([temporal, current_prices, static_features], dim=-1)  # (batch, obs_dim)
 
     @torch.no_grad()
