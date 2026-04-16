@@ -361,8 +361,16 @@ class SACAgent:
             "alpha_optimizer": self.alpha_optimizer.state_dict(),
         }, path)
 
-    def load_checkpoint(self, path: str):
-        """Load all model weights and optimizer states."""
+    def load_checkpoint(self, path: str, weights_only_mode: bool = False):
+        """Load model weights and (optionally) optimizer states.
+
+        Parameters
+        ----------
+        weights_only_mode : bool
+            If True, load only model weights (TTFE, actor, critic). Skip optimizer
+            states. Use for evaluation, or when optimizer param groups may not match
+            the current agent config (e.g. Phase B checkpoints with partial TTFE).
+        """
         ckpt = torch.load(path, map_location=self.device, weights_only=True)
         self.ttfe.load_state_dict(ckpt["ttfe"])
         self.actor.load_state_dict(ckpt["actor"])
@@ -371,10 +379,11 @@ class SACAgent:
         self.log_alpha.data.copy_(ckpt["log_alpha"])
         if "tau_gumbel" in ckpt:
             self.tau_gumbel = ckpt["tau_gumbel"]
-        self.ttfe_optimizer.load_state_dict(ckpt["ttfe_optimizer"])
-        self.actor_optimizer.load_state_dict(ckpt["actor_optimizer"])
-        self.critic_optimizer.load_state_dict(ckpt["critic_optimizer"])
-        self.alpha_optimizer.load_state_dict(ckpt["alpha_optimizer"])
+        if not weights_only_mode:
+            self.ttfe_optimizer.load_state_dict(ckpt["ttfe_optimizer"])
+            self.actor_optimizer.load_state_dict(ckpt["actor_optimizer"])
+            self.critic_optimizer.load_state_dict(ckpt["critic_optimizer"])
+            self.alpha_optimizer.load_state_dict(ckpt["alpha_optimizer"])
 
     def init_from_stage1(self, stage1_checkpoint_path: str):
         """

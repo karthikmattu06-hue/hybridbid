@@ -85,7 +85,9 @@ def evaluate(
         hidden_dim=config.hidden_dim,
         tau_gumbel=0.1,  # fully annealed → deterministic
     )
-    agent.load_checkpoint(checkpoint_path)
+    # weights_only_mode=True: skip optimizer states (may not match current config,
+    # e.g. Phase B checkpoints have partial ttfe_optimizer param groups)
+    agent.load_checkpoint(checkpoint_path, weights_only_mode=True)
 
     if verbose:
         print(f"\n=== Stage {stage} Evaluation (post-RTC+B) ===")
@@ -111,6 +113,9 @@ def evaluate(
 
         while not done:
             action = agent.select_action(obs, deterministic=True)
+            # Stage 1 agent outputs 4D; co_optimize env needs 9D — pad AS dims with zeros
+            if stage == 1 and len(action) == 4:
+                action = np.concatenate([action, np.zeros(5, dtype=action.dtype)])
             obs, _, terminated, truncated, info = env.step(action)
             done = terminated or truncated
 
