@@ -21,11 +21,19 @@ RTCB_UTC = pd.Timestamp(RTCB_BOUNDARY_UTC, tz="UTC")
 
 
 def _to_utc_index(df: pd.DataFrame, col: str = "Interval Start") -> pd.Series:
-    """Convert a timestamp column to UTC, return as Series."""
-    ts = pd.to_datetime(df[col])
-    if ts.dt.tz is None:
-        ts = ts.dt.tz_localize("US/Central", ambiguous="NaT", nonexistent="shift_forward")
-    return ts.dt.tz_convert("UTC")
+    """Convert a timestamp column to UTC, return as Series.
+
+    Uses utc=True to handle mixed-offset columns that arise when old-schema
+    (CPT fixed-offset) and new-schema (UTC-aware, normalized in fetcher) frames
+    are concatenated. Naive timestamps are localized as US/Central first.
+    """
+    raw = df[col]
+    # If all values are naive, localize as US/Central before converting
+    if pd.api.types.is_datetime64_any_dtype(raw) and raw.dt.tz is None:
+        raw = raw.dt.tz_localize("US/Central", ambiguous="NaT", nonexistent="shift_forward")
+        return raw.dt.tz_convert("UTC")
+    # Mixed or uniform tz-aware: utc=True converts everything to UTC in one pass
+    return pd.to_datetime(raw, utc=True)
 
 
 def _floor_5min(ts: pd.Series) -> pd.Series:
