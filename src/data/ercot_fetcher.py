@@ -92,6 +92,45 @@ def _save_cache(df: pd.DataFrame, product: str, date_str: str):
 # RT LMP (5-min SCED) via ErcotAPI
 # ──────────────────────────────────────────────
 
+def _normalize_rt_lmp_schema(df: pd.DataFrame, location: str) -> pd.DataFrame:
+    """
+    Normalize RT LMP DataFrame to canonical old schema before concatenation.
+
+    Old schema (pre-2026 bulk/backfill files):
+        Interval Start (tz-aware CPT), Interval End, SCED Timestamp, Market,
+        Location, Location Type, LMP
+
+    New schema (2026+ API responses):
+        SCEDTimestamp (naive local time string), RepeatHourFlag, SettlementPoint, LMP
+
+    For new-schema files: parse SCEDTimestamp as US/Central → UTC-aware, assign as
+    "Interval Start", rename SettlementPoint→Location. This ensures the concatenated
+    DataFrame has a uniform tz-aware "Interval Start" column and downstream code is
+    untouched.
+    """
+    if df.empty:
+        return df
+
+    if "SCEDTimestamp" in df.columns and "Interval Start" not in df.columns:
+        # New schema — filter by SettlementPoint
+        if "SettlementPoint" in df.columns:
+            df = df[df["SettlementPoint"] == location].copy()
+        else:
+            df = df.copy()
+        # Parse naive local-time string → US/Central → UTC-aware, then use as Interval Start
+        ts = pd.to_datetime(df["SCEDTimestamp"])
+        ts = ts.dt.tz_localize("US/Central", ambiguous="NaT", nonexistent="shift_forward")
+        ts = ts.dt.tz_convert("UTC")
+        df["Interval Start"] = ts
+        df = df.rename(columns={"SettlementPoint": "Location"})
+        df = df.reset_index(drop=True)
+    elif "Location" in df.columns:
+        # Old schema — apply location filter as before
+        df = df[df["Location"] == location].reset_index(drop=True)
+
+    return df
+
+
 def fetch_rt_lmp(start: str, end: str, location: str = "HB_HUBAVG") -> pd.DataFrame:
     """
     Fetch RT LMPs from ErcotAPI (NP6-788-CD, 5-min SCED intervals).
@@ -100,6 +139,7 @@ def fetch_rt_lmp(start: str, end: str, location: str = "HB_HUBAVG") -> pd.DataFr
         Interval Start, Interval End, SCED Timestamp, Market, Location, Location Type, LMP
 
     Filtered to the specified location (default: HB_HUBAVG).
+    Handles both old (pre-2026) and new (2026+) ERCOT API response schemas.
     """
     start_ts = pd.Timestamp(start)
     end_ts = pd.Timestamp(end)
@@ -115,7 +155,7 @@ def fetch_rt_lmp(start: str, end: str, location: str = "HB_HUBAVG") -> pd.DataFr
         cached = _load_cached("rt_lmp", date_str)
         if cached is not None:
             logger.info(f"RT LMP {date_str}: loaded from cache ({len(cached)} rows)")
-            all_frames.append(cached)
+            all_frames.append(_normalize_rt_lmp_schema(cached, location))
             current = next_day
             continue
 
@@ -127,13 +167,9 @@ def fetch_rt_lmp(start: str, end: str, location: str = "HB_HUBAVG") -> pd.DataFr
                 end=next_day.strftime("%Y-%m-%d"),
                 verbose=False,
             )
-            # Filter to requested location before caching
-            if not df.empty and "Location" in df.columns:
-                df = df[df["Location"] == location].reset_index(drop=True)
+            _save_cache(df, "rt_lmp", date_str)  # cache raw schema before normalizing
+            all_frames.append(_normalize_rt_lmp_schema(df, location))
             logger.info(f"RT LMP {date_str}: got {len(df)} rows")
-            _save_cache(df, "rt_lmp", date_str)
-            all_frames.append(df)
-            # Rate limit protection between day requests
             logger.debug(f"RT LMP: sleeping 2s before next day...")
             time.sleep(2)
         except Exception as e:
