@@ -416,7 +416,20 @@ if __name__ == "__main__":
         help="Stage 1 Tier 1 v1: BroNet critic + HL-Gauss loss + fixed alpha=0.1 "
              "+ gamma=0.97 + tau=0.001 + AdamW. 500k validation run."
     )
+    parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility")
+    parser.add_argument("--checkpoint-dir", type=str, default=None, help="Override checkpoint directory")
     args = parser.parse_args()
+
+    # Set seed before anything else
+    if args.seed is not None:
+        import torch
+        import random
+        import numpy as np
+        torch.manual_seed(args.seed)
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(args.seed)
 
     if args.tier1:
         config = Stage1Tier1Config()
@@ -436,5 +449,7 @@ if __name__ == "__main__":
         config.device = args.device
     if args.log_interval is not None:
         config.log_interval = args.log_interval
+    if args.checkpoint_dir is not None:
+        config.checkpoint_dir = args.checkpoint_dir
 
     train_stage1(config, enriched_obs=args.v60)
