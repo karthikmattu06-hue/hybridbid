@@ -59,7 +59,10 @@ def train_stage1(config: Stage1Config = None, enriched_obs: bool = False):
         print(f"Polyak tau: {config.tau}")
         print(f"HL-Gauss: support=[{config.hl_gauss_min}, {config.hl_gauss_max}], "
               f"n_atoms={config.n_atoms}, sigma={config.hl_gauss_sigma}")
-        print(f"Gradient clip: {config.max_grad_norm} (actor, critic separately)")
+        print(f"Reward pre-scale: ÷{config.reward_scale} before symlog")
+        print(f"Gradient clip: actor={config.max_grad_norm} critic={config.max_grad_norm} "
+              f"ttfe={config.max_grad_norm_ttfe}")
+        print(f"TTFE optimizer: Adam lr={config.lr_ttfe}")
     else:
         print(f"Max grad norm: actor/ttfe={config.max_grad_norm} "
               f"critic={getattr(config, 'max_grad_norm_critic', None) or config.max_grad_norm}")
@@ -111,6 +114,7 @@ def train_stage1(config: Stage1Config = None, enriched_obs: bool = False):
             buffer_capacity=config.buffer_capacity,
             batch_size=config.batch_size,
             max_grad_norm=config.max_grad_norm,
+            max_grad_norm_ttfe=getattr(config, "max_grad_norm_ttfe", None),
             n_atoms=config.n_atoms,
             hl_gauss_min=config.hl_gauss_min,
             hl_gauss_max=config.hl_gauss_max,
@@ -181,12 +185,21 @@ def train_stage1(config: Stage1Config = None, enriched_obs: bool = False):
         # Step environment
         next_obs, reward, terminated, truncated, info = env.step(action)
 
-        # Apply symlog to economic reward component; keep SoC penalty at original scale.
-        # symlog compresses ERCOT's heavy-tailed price distribution (Cauchy residuals,
-        # Uri storm $9k/MWh) without destroying reward ordering. DreamerV3 (Hafner 2023).
-        soc_penalty = -50.0 if info["soc_violated"] else 0.0
+        # Apply symlog to economic reward component.
         raw_econ = info["energy_revenue"] + info["timing_bonus"]
-        transformed_reward = symlog(raw_econ) + soc_penalty
+        if is_tier1:
+            # Pre-scale before symlog: ERCOT rewards of $0–1500/step compress to
+            # $0–15, so symlog ≈ [0, 2.8], discounted return stays in HL-Gauss
+            # support. Without scaling: q_symlog≈10 → symexp grad ≈ 22k → actor
+            # grad explosion → TTFE corruption (observed: grad_a=1274 at step 6k).
+            # SoC penalty scaled proportionally: -50/100 = -0.5 → symlog(-0.5) ≈ -0.41
+            reward_scale = config.reward_scale
+            scaled_econ = raw_econ / reward_scale
+            soc_penalty_raw = -50.0 / reward_scale if info["soc_violated"] else 0.0
+            transformed_reward = symlog(scaled_econ) + symlog(soc_penalty_raw)
+        else:
+            soc_penalty = -50.0 if info["soc_violated"] else 0.0
+            transformed_reward = symlog(raw_econ) + soc_penalty
 
         episode_reward += transformed_reward
         episode_raw_reward += reward  # original env reward (pre-symlog) for logging

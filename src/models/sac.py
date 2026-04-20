@@ -547,6 +547,7 @@ class SACAgentTier1:
         buffer_capacity: int = None,
         batch_size: int = None,
         max_grad_norm: float = 1.0,
+        max_grad_norm_ttfe: float = None,  # separate tighter TTFE clip; None → use max_grad_norm
         n_atoms: int = 101,
         hl_gauss_min: float = -20.0,
         hl_gauss_max: float = 20.0,
@@ -559,6 +560,7 @@ class SACAgentTier1:
         self.tau = tau
         self.alpha = alpha            # Fixed scalar — no log_alpha, no optimizer
         self.max_grad_norm = max_grad_norm
+        self.max_grad_norm_ttfe = max_grad_norm_ttfe if max_grad_norm_ttfe is not None else max_grad_norm
         self.tau_gumbel = tau_gumbel
 
         self.n_as_dims = 0 if stage == 1 else 5
@@ -715,11 +717,15 @@ class SACAgentTier1:
         mode_probs_mean = new_actions[:, :3].mean(dim=0).detach().cpu().tolist()
 
         q1_new_logits, q2_new_logits = self.critic(obs_encoded.detach(), new_actions)
-        q1_new_raw, _ = self.hl_gauss.compute_q(q1_new_logits)
-        q2_new_raw, _ = self.hl_gauss.compute_q(q2_new_logits)
+        q1_new_raw, q1_new_symlog = self.hl_gauss.compute_q(q1_new_logits)
+        q2_new_raw, q2_new_symlog = self.hl_gauss.compute_q(q2_new_logits)
         q_new = torch.min(q1_new_raw, q2_new_raw)  # raw scale for policy gradient
+        q_new_symlog = torch.min(q1_new_symlog, q2_new_symlog)
         q_value_mean = q_new.mean().item()
         q_value_max_abs = q_new.abs().max().item()
+        # symlog-scale Q — directly comparable to HL-Gauss support bounds [±20]
+        q_symlog_mean_actor = q_new_symlog.mean().item()
+        q_symlog_maxabs_actor = q_new_symlog.abs().max().item()
 
         actor_loss = (self.alpha * log_probs - q_new).mean()
 
@@ -733,7 +739,7 @@ class SACAgentTier1:
             [self.ttfe.input_proj.weight, self.ttfe.input_proj.bias, self.ttfe.pos_embedding]
         )
         grad_ttfe_attn = _grad_norm(self.ttfe.transformer.parameters())
-        ttfe_grad_norm = nn.utils.clip_grad_norm_(self.ttfe.parameters(), self.max_grad_norm)
+        ttfe_grad_norm = nn.utils.clip_grad_norm_(self.ttfe.parameters(), self.max_grad_norm_ttfe)
         self.actor_optimizer.step()
         self.ttfe_optimizer.step()
 
@@ -766,8 +772,9 @@ class SACAgentTier1:
             "q_mean": q_value_mean,
             "q_max_abs": q_value_max_abs,
             # HL-Gauss specific (Tier 1 enhanced logging)
-            "q_expected_mean": q_value_mean,
-            "q_expected_max_abs": q_value_max_abs,
+            # q_expected_* are in SYMLOG space — directly comparable to support bounds ±20
+            "q_expected_mean": q_symlog_mean_actor,
+            "q_expected_max_abs": q_symlog_maxabs_actor,
             "q_symlog_mean": q_symlog_mean,
             "critic_bin_entropy": bin_entropy,
             "critic_bin_argmax_support_value": argmax_support_val,

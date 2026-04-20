@@ -178,6 +178,17 @@ class Stage1Tier1Config(Stage1Config):
     idle_logit_bonus: float = 0.0
     max_grad_norm_critic: float = None  # type: ignore[assignment]  # unified clip
 
+    # Reward pre-scaling: divide raw $ reward by REWARD_SCALE before symlog.
+    # ERCOT rewards span $0–1500 normally (spikes to $10k+). At REWARD_SCALE=100,
+    # symlog maps to [0, 2.8], discounted return ≈ 6.2 in symlog → symexp gradient
+    # amplification ≈ 500×. Without scaling, raw rewards of $600+ compound to
+    # q_symlog ≈ 10 → symexp gradient 22,000× → actor grad explosion → TTFE corruption.
+    reward_scale: float = 100.0
+
+    # TTFE clip (kept as secondary safety belt alongside reward scaling)
+    lr_ttfe: float = 3e-4              # restored — reward scaling fixes root cause
+    max_grad_norm_ttfe: float = 0.5    # moderate TTFE clip (not as aggressive as 0.1)
+
     # Run config
     total_steps: int = 500_000
     checkpoint_dir: str = "checkpoints/stage1_tier1_v1"
