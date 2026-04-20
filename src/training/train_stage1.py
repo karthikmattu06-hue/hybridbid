@@ -26,15 +26,19 @@ def symlog(x: float) -> float:
     return math.copysign(math.log1p(abs(x)), x)
 
 from src.env.ercot_env import ERCOTBatteryEnv
-from src.models.sac import SACAgent
-from src.training.config import Stage1Config, Stage1V60Config, Stage1V592Config
+from src.models.sac import SACAgent, SACAgentTier1
+from src.training.config import Stage1Config, Stage1V60Config, Stage1V592Config, Stage1Tier1Config
 
 
 def train_stage1(config: Stage1Config = None, enriched_obs: bool = False):
     if config is None:
         config = Stage1Config()
 
-    if isinstance(config, Stage1V592Config):
+    is_tier1 = isinstance(config, Stage1Tier1Config)
+
+    if is_tier1:
+        version = "tier1_v1"
+    elif isinstance(config, Stage1V592Config):
         version = "v5.9.2"
     elif enriched_obs:
         version = "v6.0"
@@ -44,12 +48,25 @@ def train_stage1(config: Stage1Config = None, enriched_obs: bool = False):
     print(f"Data: {config.train_start} to {config.train_end}")
     print(f"Device: {config.device}")
     print(f"Total steps: {config.total_steps}")
-    print(f"Max grad norm: actor/ttfe={config.max_grad_norm} "
-          f"critic={getattr(config, 'max_grad_norm_critic', None) or config.max_grad_norm}")
-    print(f"LR: actor={config.lr_actor} critic={config.lr_critic} ttfe={config.lr_ttfe}")
-    print(f"τ_gumbel: {config.tau_gumbel_init} → {config.tau_gumbel_final}")
-    print(f"Alpha bounds: [0.05, {getattr(config, 'alpha_max', 'inf')}]  "
-          f"idle_logit_bonus={getattr(config, 'idle_logit_bonus', 0.0)}")
+
+    if is_tier1:
+        print("=== Stage 1 Tier 1 v1 Configuration ===")
+        print("Critic: BroNet (LayerNorm + 2 residual blocks + HL-Gauss 101 bins)")
+        print(f"Critic optimizer: AdamW lr={config.lr_critic} weight_decay={config.weight_decay_critic}")
+        print(f"Actor optimizer: Adam lr={config.lr_actor} (unchanged)")
+        print(f"Gamma: {config.gamma}")
+        print(f"Alpha: {config.alpha_fixed} (FIXED, no auto-tuning)")
+        print(f"Polyak tau: {config.tau}")
+        print(f"HL-Gauss: support=[{config.hl_gauss_min}, {config.hl_gauss_max}], "
+              f"n_atoms={config.n_atoms}, sigma={config.hl_gauss_sigma}")
+        print(f"Gradient clip: {config.max_grad_norm} (actor, critic separately)")
+    else:
+        print(f"Max grad norm: actor/ttfe={config.max_grad_norm} "
+              f"critic={getattr(config, 'max_grad_norm_critic', None) or config.max_grad_norm}")
+        print(f"LR: actor={config.lr_actor} critic={config.lr_critic} ttfe={config.lr_ttfe}")
+        print(f"τ_gumbel: {config.tau_gumbel_init} → {config.tau_gumbel_final}")
+        print(f"Alpha bounds: [0.05, {getattr(config, 'alpha_max', 'inf')}]  "
+              f"idle_logit_bonus={getattr(config, 'idle_logit_bonus', 0.0)}")
     if enriched_obs:
         n_prices_flat = getattr(config, "n_prices_flat", config.n_prices)
         obs_dim = config.d_model + n_prices_flat + config.static_dim
@@ -73,30 +90,58 @@ def train_stage1(config: Stage1Config = None, enriched_obs: bool = False):
     )
 
     # Create SAC agent
-    agent = SACAgent(
-        stage=1,
-        device=config.device,
-        n_prices=config.n_prices,
-        n_prices_flat=getattr(config, "n_prices_flat", None),
-        d_model=config.d_model,
-        nhead=config.nhead,
-        n_layers=config.n_layers,
-        seq_len=config.seq_len,
-        static_dim=config.static_dim,
-        hidden_dim=config.hidden_dim,
-        lr_actor=config.lr_actor,
-        lr_critic=config.lr_critic,
-        lr_ttfe=config.lr_ttfe,
-        gamma=config.gamma,
-        tau=config.tau,
-        buffer_capacity=config.buffer_capacity,
-        batch_size=config.batch_size,
-        max_grad_norm=config.max_grad_norm,
-        max_grad_norm_critic=getattr(config, "max_grad_norm_critic", None),
-        alpha_max=getattr(config, "alpha_max", float("inf")),
-        idle_logit_bonus=getattr(config, "idle_logit_bonus", 0.0),
-        tau_gumbel=config.tau_gumbel_init,
-    )
+    if is_tier1:
+        agent = SACAgentTier1(
+            stage=1,
+            device=config.device,
+            n_prices=config.n_prices,
+            d_model=config.d_model,
+            nhead=config.nhead,
+            n_layers=config.n_layers,
+            seq_len=config.seq_len,
+            static_dim=config.static_dim,
+            hidden_dim=config.hidden_dim,
+            lr_actor=config.lr_actor,
+            lr_critic=config.lr_critic,
+            lr_ttfe=config.lr_ttfe,
+            gamma=config.gamma,
+            tau=config.tau,
+            alpha=config.alpha_fixed,
+            weight_decay=config.weight_decay_critic,
+            buffer_capacity=config.buffer_capacity,
+            batch_size=config.batch_size,
+            max_grad_norm=config.max_grad_norm,
+            n_atoms=config.n_atoms,
+            hl_gauss_min=config.hl_gauss_min,
+            hl_gauss_max=config.hl_gauss_max,
+            hl_gauss_sigma=config.hl_gauss_sigma,
+            tau_gumbel=config.tau_gumbel_init,
+        )
+    else:
+        agent = SACAgent(
+            stage=1,
+            device=config.device,
+            n_prices=config.n_prices,
+            n_prices_flat=getattr(config, "n_prices_flat", None),
+            d_model=config.d_model,
+            nhead=config.nhead,
+            n_layers=config.n_layers,
+            seq_len=config.seq_len,
+            static_dim=config.static_dim,
+            hidden_dim=config.hidden_dim,
+            lr_actor=config.lr_actor,
+            lr_critic=config.lr_critic,
+            lr_ttfe=config.lr_ttfe,
+            gamma=config.gamma,
+            tau=config.tau,
+            buffer_capacity=config.buffer_capacity,
+            batch_size=config.batch_size,
+            max_grad_norm=config.max_grad_norm,
+            max_grad_norm_critic=getattr(config, "max_grad_norm_critic", None),
+            alpha_max=getattr(config, "alpha_max", float("inf")),
+            idle_logit_bonus=getattr(config, "idle_logit_bonus", 0.0),
+            tau_gumbel=config.tau_gumbel_init,
+        )
 
     # Gumbel temperature annealing schedule
     tau_gumbel_range = config.tau_gumbel_init - config.tau_gumbel_final
@@ -243,29 +288,58 @@ def train_stage1(config: Stage1Config = None, enriched_obs: bool = False):
             b_dc = metrics.get('mode_probs_dc', 0) * 100
             b_id = metrics.get('mode_probs_id', 0) * 100
 
-            print(
-                f"Step {step:>7d}/{config.total_steps} | "
-                f"ep={episode_count} | "
-                f"critic={metrics.get('critic_loss', 0):.4f} | "
-                f"actor={metrics.get('actor_loss', 0):.4f} | "
-                f"alpha={metrics.get('alpha', 0):.4f} | "
-                f"avg_reward={avg_reward:.1f} | "
-                f"avg_raw_reward={avg_raw_reward:.1f} | "
-                f"avg_soc={avg_soc:.2f} | "
-                f"grad_c={metrics.get('grad_c_pre_clip', metrics.get('critic_grad_norm', 0)):.3f}"
-                f"→{metrics.get('grad_c_post_clip', metrics.get('critic_grad_norm', 0)):.3f} "
-                f"[q1={metrics.get('grad_q1', 0):.1f} q2={metrics.get('grad_q2', 0):.1f}] | "
-                f"grad_a={metrics.get('grad_a_pre_clip', metrics.get('actor_grad_norm', 0)):.3f}"
-                f"→{metrics.get('grad_a_post_clip', metrics.get('actor_grad_norm', 0)):.3f} | "
-                f"grad_t={metrics.get('ttfe_grad_norm', 0):.3f} "
-                f"[proj={metrics.get('grad_ttfe_proj', 0):.1f} attn={metrics.get('grad_ttfe_attn', 0):.1f}] | "
-                f"q_mean={metrics.get('q_mean', 0):.2f} q_maxabs={metrics.get('q_max_abs', 0):.1f} | "
-                f"mode_env=[ch={mode_pct_charge:.0f}% dc={mode_pct_discharge:.0f}% id={mode_pct_idle:.0f}%] "
-                f"mode_batch=[ch={b_ch:.0f}% dc={b_dc:.0f}% id={b_id:.0f}%] | "
-                f"tau_g={gumbel_temperature:.3f} | "
-                f"{steps_per_sec:.1f} steps/s{feat_str}{nan_flag}",
-                flush=True,
-            )
+            if is_tier1:
+                # Tier 1: no alpha logging; add HL-Gauss diagnostics
+                tier1_str = (
+                    f" | bin_ent={metrics.get('critic_bin_entropy', 0):.3f}"
+                    f" bin_argmax={metrics.get('critic_bin_argmax_support_value', 0):.2f}"
+                    f" q_exp_mean={metrics.get('q_expected_mean', 0):.2f}"
+                    f" q_exp_maxabs={metrics.get('q_expected_max_abs', 0):.1f}"
+                )
+                print(
+                    f"Step {step:>7d}/{config.total_steps} | "
+                    f"ep={episode_count} | "
+                    f"critic={metrics.get('critic_loss', 0):.4f} | "
+                    f"actor={metrics.get('actor_loss', 0):.4f} | "
+                    f"avg_reward={avg_reward:.1f} | "
+                    f"avg_raw_reward={avg_raw_reward:.1f} | "
+                    f"avg_soc={avg_soc:.2f} | "
+                    f"grad_c={metrics.get('grad_c_pre_clip', 0):.3f}"
+                    f"→{metrics.get('grad_c_post_clip', 0):.3f} | "
+                    f"grad_a={metrics.get('grad_a_pre_clip', 0):.3f}"
+                    f"→{metrics.get('grad_a_post_clip', 0):.3f} | "
+                    f"grad_t={metrics.get('ttfe_grad_norm', 0):.3f} "
+                    f"[proj={metrics.get('grad_ttfe_proj', 0):.1f} attn={metrics.get('grad_ttfe_attn', 0):.1f}] | "
+                    f"mode_env=[ch={mode_pct_charge:.0f}% dc={mode_pct_discharge:.0f}% id={mode_pct_idle:.0f}%] "
+                    f"mode_batch=[ch={b_ch:.0f}% dc={b_dc:.0f}% id={b_id:.0f}%] | "
+                    f"tau_g={gumbel_temperature:.3f} | "
+                    f"{steps_per_sec:.1f} steps/s{tier1_str}{nan_flag}",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"Step {step:>7d}/{config.total_steps} | "
+                    f"ep={episode_count} | "
+                    f"critic={metrics.get('critic_loss', 0):.4f} | "
+                    f"actor={metrics.get('actor_loss', 0):.4f} | "
+                    f"alpha={metrics.get('alpha', 0):.4f} | "
+                    f"avg_reward={avg_reward:.1f} | "
+                    f"avg_raw_reward={avg_raw_reward:.1f} | "
+                    f"avg_soc={avg_soc:.2f} | "
+                    f"grad_c={metrics.get('grad_c_pre_clip', metrics.get('critic_grad_norm', 0)):.3f}"
+                    f"→{metrics.get('grad_c_post_clip', metrics.get('critic_grad_norm', 0)):.3f} "
+                    f"[q1={metrics.get('grad_q1', 0):.1f} q2={metrics.get('grad_q2', 0):.1f}] | "
+                    f"grad_a={metrics.get('grad_a_pre_clip', metrics.get('actor_grad_norm', 0)):.3f}"
+                    f"→{metrics.get('grad_a_post_clip', metrics.get('actor_grad_norm', 0)):.3f} | "
+                    f"grad_t={metrics.get('ttfe_grad_norm', 0):.3f} "
+                    f"[proj={metrics.get('grad_ttfe_proj', 0):.1f} attn={metrics.get('grad_ttfe_attn', 0):.1f}] | "
+                    f"q_mean={metrics.get('q_mean', 0):.2f} q_maxabs={metrics.get('q_max_abs', 0):.1f} | "
+                    f"mode_env=[ch={mode_pct_charge:.0f}% dc={mode_pct_discharge:.0f}% id={mode_pct_idle:.0f}%] "
+                    f"mode_batch=[ch={b_ch:.0f}% dc={b_dc:.0f}% id={b_id:.0f}%] | "
+                    f"tau_g={gumbel_temperature:.3f} | "
+                    f"{steps_per_sec:.1f} steps/s{feat_str}{nan_flag}",
+                    flush=True,
+                )
 
             if has_nan:
                 print("FATAL: NaN detected in metrics. Saving emergency checkpoint and stopping.")
@@ -324,9 +398,16 @@ if __name__ == "__main__":
         help="Stage 1 v5.9.2: stability fixes (lr_critic=1e-4, critic_clip=0.5, "
              "alpha_max=0.5, idle_logit_bonus=0.1). 500k validation run."
     )
+    parser.add_argument(
+        "--tier1", action="store_true",
+        help="Stage 1 Tier 1 v1: BroNet critic + HL-Gauss loss + fixed alpha=0.1 "
+             "+ gamma=0.97 + tau=0.001 + AdamW. 500k validation run."
+    )
     args = parser.parse_args()
 
-    if args.v592:
+    if args.tier1:
+        config = Stage1Tier1Config()
+    elif args.v592:
         config = Stage1V592Config()
     elif args.v60:
         config = Stage1V60Config()

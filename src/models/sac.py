@@ -15,7 +15,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from src.models.ttfe import TTFE
-from src.models.networks import Actor, TwinCritic
+from src.models.networks import Actor, TwinCritic, TwinBroNetCritic, HLGaussLoss
 from src.models.replay_buffer import ReplayBuffer
 
 
@@ -501,3 +501,330 @@ class SACAgent:
         for p in self.ttfe.parameters():
             p.requires_grad = True
         self.ttfe_optimizer = torch.optim.Adam(self.ttfe.parameters(), lr=lr)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tier 1 agent: BroNetCritic + HL-Gauss loss + fixed alpha + γ=0.97 + τ=0.001
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class SACAgentTier1:
+    """
+    Stage 1 Tier 1 agent — architectural changes to fix Q-value explosion:
+
+    1. BroNetCritic (LayerNorm + 2 residual blocks + HL-Gauss categorical head)
+    2. HL-Gauss cross-entropy critic loss (Farebrother et al. ICML 2024)
+    3. AdamW with weight_decay=0.1 for critic optimizer
+    4. γ = 0.97 (effective horizon ~33 steps @ 5-min)
+    5. Fixed alpha = 0.1 (no auto-tuning — breaks Q-swing → α-swing feedback loop)
+    6. Polyak τ = 0.001 (slower target updates contain spike propagation)
+    7. Gradient clip max_norm=1.0 on combined critic params
+    8. No idle_logit_bonus, no alpha clamp (band-aids removed)
+
+    Actor and TTFE are unchanged from v5.9.x.
+    """
+
+    PRICE_NORM = 1000.0  # same as SACAgent
+
+    def __init__(
+        self,
+        stage: int = 1,
+        device: str = "cpu",
+        n_prices: int = 12,
+        d_model: int = 64,
+        nhead: int = 8,
+        n_layers: int = 2,
+        seq_len: int = 32,
+        static_dim: int = 14,
+        hidden_dim: int = 512,        # BroNet uses 512
+        lr_actor: float = 3e-4,
+        lr_critic: float = 1e-4,
+        lr_ttfe: float = 3e-4,
+        gamma: float = 0.97,
+        tau: float = 0.001,
+        alpha: float = 0.1,           # Fixed — no auto-tuning
+        weight_decay: float = 0.1,    # AdamW weight decay for critic
+        buffer_capacity: int = None,
+        batch_size: int = None,
+        max_grad_norm: float = 1.0,
+        n_atoms: int = 101,
+        hl_gauss_min: float = -20.0,
+        hl_gauss_max: float = 20.0,
+        hl_gauss_sigma: float = 0.75,
+        tau_gumbel: float = 1.0,
+    ):
+        self.stage = stage
+        self.device = device
+        self.gamma = gamma
+        self.tau = tau
+        self.alpha = alpha            # Fixed scalar — no log_alpha, no optimizer
+        self.max_grad_norm = max_grad_norm
+        self.tau_gumbel = tau_gumbel
+
+        self.n_as_dims = 0 if stage == 1 else 5
+        self.action_dim = 3 + 1 + self.n_as_dims
+        self.n_prices = n_prices
+        self.obs_dim = d_model + n_prices + static_dim  # e.g. 64+12+14=90
+
+        if buffer_capacity is None:
+            buffer_capacity = 1_000_000 if stage == 1 else 50_000
+        if batch_size is None:
+            batch_size = 256 if stage == 1 else 128
+        self.batch_size = batch_size
+
+        # HL-Gauss loss (device-aware support tensor)
+        self.hl_gauss = HLGaussLoss(
+            min_value=hl_gauss_min,
+            max_value=hl_gauss_max,
+            n_atoms=n_atoms,
+            sigma=hl_gauss_sigma,
+        ).to(device)
+
+        # Networks
+        self.ttfe = TTFE(
+            n_prices=n_prices, d_model=d_model, nhead=nhead,
+            n_layers=n_layers, seq_len=seq_len,
+        ).to(device)
+        self.actor = Actor(
+            obs_dim=self.obs_dim, n_as_dims=self.n_as_dims, hidden_dim=hidden_dim,
+        ).to(device)
+        self.critic = TwinBroNetCritic(
+            obs_dim=self.obs_dim, action_dim=self.action_dim,
+            hidden=hidden_dim, n_atoms=n_atoms,
+        ).to(device)
+        self.critic_target = copy.deepcopy(self.critic).to(device)
+        for p in self.critic_target.parameters():
+            p.requires_grad = False
+
+        # Optimizers
+        self.ttfe_optimizer = torch.optim.Adam(self.ttfe.parameters(), lr=lr_ttfe)
+        self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=lr_actor)
+        # AdamW with weight decay for critic (Change 3)
+        self.critic_optimizer = torch.optim.AdamW(
+            list(self.critic.q1.parameters()) + list(self.critic.q2.parameters()),
+            lr=lr_critic,
+            weight_decay=weight_decay,
+            betas=(0.9, 0.999),
+        )
+
+        # Replay buffer
+        self.buffer = ReplayBuffer(
+            capacity=buffer_capacity,
+            seq_len=seq_len,
+            n_prices=n_prices,
+            static_dim=static_dim,
+            action_dim=self.action_dim,
+        )
+
+    def _encode_obs(
+        self, price_history: torch.Tensor, static_features: torch.Tensor
+    ) -> torch.Tensor:
+        ph_norm = price_history / self.PRICE_NORM
+        temporal = self.ttfe(ph_norm)
+        current_prices = ph_norm[:, -1, :]
+        return torch.cat([temporal, current_prices, static_features], dim=-1)
+
+    @torch.no_grad()
+    def select_action(self, obs: dict, deterministic: bool = False) -> np.ndarray:
+        self.ttfe.eval()
+        self.actor.eval()
+
+        ph = torch.tensor(obs["price_history"], dtype=torch.float32, device=self.device).unsqueeze(0)
+        sf = torch.tensor(obs["static_features"], dtype=torch.float32, device=self.device).unsqueeze(0)
+        encoded = self._encode_obs(ph, sf)
+
+        if deterministic:
+            _, _, action = self.actor.sample(encoded, tau=self.tau_gumbel, hard=True)
+        else:
+            action, _, _ = self.actor.sample(encoded, tau=self.tau_gumbel, hard=False)
+
+        self.ttfe.train()
+        self.actor.train()
+        return action.squeeze(0).cpu().numpy()
+
+    def update(self, batch: dict = None, tau_gumbel: float = None) -> dict:
+        """
+        One Tier 1 SAC update step.
+
+        Critic: HL-Gauss cross-entropy loss on symlog-space TD targets.
+        Actor:  Standard policy gradient with fixed alpha, Q in raw scale (symexp).
+        TTFE:   Updated only via actor gradient (no critic path).
+        Alpha:  Fixed — no update.
+        """
+        if tau_gumbel is None:
+            tau_gumbel = self.tau_gumbel
+
+        if batch is None:
+            if len(self.buffer) < self.batch_size:
+                return {}
+            batch = self.buffer.sample(self.batch_size, device=self.device)
+
+        ph = batch["price_history"]
+        sf = batch["static_features"]
+        actions = batch["actions"]
+        rewards = batch["rewards"]          # (batch, 1), symlog-transformed
+        next_ph = batch["next_price_history"]
+        next_sf = batch["next_static_features"]
+        dones = batch["dones"]              # (batch, 1)
+
+        obs_encoded = self._encode_obs(ph, sf)
+        with torch.no_grad():
+            next_obs_encoded = self._encode_obs(next_ph, next_sf)
+
+        # ── Critic update ────────────────────────────────────────────────────
+        with torch.no_grad():
+            next_actions, next_log_probs, _ = self.actor.sample(
+                next_obs_encoded, tau=tau_gumbel, hard=False,
+            )
+            # Get next Q in symlog space from target networks
+            next_q1_logits, next_q2_logits = self.critic_target(next_obs_encoded, next_actions)
+            _, next_q1_symlog = self.hl_gauss.compute_q(next_q1_logits)   # (batch, 1)
+            _, next_q2_symlog = self.hl_gauss.compute_q(next_q2_logits)
+            next_q_symlog = torch.min(next_q1_symlog, next_q2_symlog)
+
+            # TD target in symlog space.
+            # rewards are already symlog-transformed; log_probs in nats.
+            # alpha * log_prob is small (≈0.1 * [-2,2] = [-0.2,0.2]) vs Q (±5 symlog).
+            target_symlog = rewards + (1.0 - dones) * self.gamma * (
+                next_q_symlog - self.alpha * next_log_probs
+            )  # (batch, 1)
+
+        q1_logits, q2_logits = self.critic(obs_encoded.detach(), actions)
+        target_1d = target_symlog.squeeze(-1)  # (batch,) for HL-Gauss
+        critic1_loss = self.hl_gauss.loss(q1_logits, target_1d).mean()
+        critic2_loss = self.hl_gauss.loss(q2_logits, target_1d).mean()
+        critic_loss = critic1_loss + critic2_loss
+
+        self.critic_optimizer.zero_grad()
+        critic_loss.backward()
+        # Combined clip across both sub-critics
+        all_critic_params = list(self.critic.q1.parameters()) + list(self.critic.q2.parameters())
+        critic_grad_norm = nn.utils.clip_grad_norm_(all_critic_params, max_norm=self.max_grad_norm)
+        grad_c_pre_clip = critic_grad_norm.item()
+        grad_c_post_clip = min(grad_c_pre_clip, self.max_grad_norm)
+        self.critic_optimizer.step()
+
+        # NaN check
+        nan_found, nan_name = has_nan_params(self.critic)
+        if nan_found:
+            return {"nan_detected": True, "nan_source": f"critic.{nan_name}"}
+
+        # ── Actor + TTFE update ──────────────────────────────────────────────
+        # TTFE updated only via actor gradient (not critic path — avoids Q-amplification).
+        new_actions, log_probs, _ = self.actor.sample(obs_encoded, tau=tau_gumbel, hard=False)
+        mode_probs_mean = new_actions[:, :3].mean(dim=0).detach().cpu().tolist()
+
+        q1_new_logits, q2_new_logits = self.critic(obs_encoded.detach(), new_actions)
+        q1_new_raw, _ = self.hl_gauss.compute_q(q1_new_logits)
+        q2_new_raw, _ = self.hl_gauss.compute_q(q2_new_logits)
+        q_new = torch.min(q1_new_raw, q2_new_raw)  # raw scale for policy gradient
+        q_value_mean = q_new.mean().item()
+        q_value_max_abs = q_new.abs().max().item()
+
+        actor_loss = (self.alpha * log_probs - q_new).mean()
+
+        self.actor_optimizer.zero_grad()
+        self.ttfe_optimizer.zero_grad()
+        actor_loss.backward()
+        actor_grad_norm = nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
+        grad_a_pre_clip = actor_grad_norm.item()
+        grad_a_post_clip = min(grad_a_pre_clip, self.max_grad_norm)
+        grad_ttfe_proj = _grad_norm(
+            [self.ttfe.input_proj.weight, self.ttfe.input_proj.bias, self.ttfe.pos_embedding]
+        )
+        grad_ttfe_attn = _grad_norm(self.ttfe.transformer.parameters())
+        ttfe_grad_norm = nn.utils.clip_grad_norm_(self.ttfe.parameters(), self.max_grad_norm)
+        self.actor_optimizer.step()
+        self.ttfe_optimizer.step()
+
+        nan_found, nan_name = has_nan_params(self.actor)
+        if nan_found:
+            return {"nan_detected": True, "nan_source": f"actor.{nan_name}"}
+        nan_found, nan_name = has_nan_params(self.ttfe)
+        if nan_found:
+            return {"nan_detected": True, "nan_source": f"ttfe.{nan_name}"}
+
+        # ── Soft update target ───────────────────────────────────────────────
+        self._soft_update()
+
+        # ── HL-Gauss diagnostic metrics (from Q1 on current obs) ─────────────
+        with torch.no_grad():
+            probs1 = F.softmax(q1_logits.detach(), dim=-1)  # (batch, n_atoms)
+            bin_entropy = -(probs1 * torch.log(probs1 + 1e-8)).sum(dim=-1).mean().item()
+            argmax_idx = probs1.argmax(dim=-1).float()       # (batch,)
+            support = self.hl_gauss.support                  # (n_atoms,)
+            argmax_support_val = support[probs1.argmax(dim=-1)].mean().item()
+            # Q in symlog space for logging (bounded — useful to track saturation)
+            _, q1_symlog = self.hl_gauss.compute_q(q1_logits.detach())
+            _, q2_symlog = self.hl_gauss.compute_q(q2_logits.detach())
+            q_symlog_mean = torch.min(q1_symlog, q2_symlog).mean().item()
+
+        return {
+            "critic_loss": critic_loss.item(),
+            "actor_loss": actor_loss.item(),
+            # Q metrics (raw scale — actor loss signal)
+            "q_mean": q_value_mean,
+            "q_max_abs": q_value_max_abs,
+            # HL-Gauss specific (Tier 1 enhanced logging)
+            "q_expected_mean": q_value_mean,
+            "q_expected_max_abs": q_value_max_abs,
+            "q_symlog_mean": q_symlog_mean,
+            "critic_bin_entropy": bin_entropy,
+            "critic_bin_argmax_support_value": argmax_support_val,
+            # Gradient norms
+            "grad_c_pre_clip": grad_c_pre_clip,
+            "grad_c_post_clip": grad_c_post_clip,
+            "critic_grad_norm": grad_c_pre_clip,
+            "grad_a_pre_clip": grad_a_pre_clip,
+            "grad_a_post_clip": grad_a_post_clip,
+            "actor_grad_norm": grad_a_pre_clip,
+            "ttfe_grad_norm": ttfe_grad_norm.item(),
+            "grad_ttfe_proj": grad_ttfe_proj,
+            "grad_ttfe_attn": grad_ttfe_attn,
+            # Mode distribution
+            "mode_probs_ch": mode_probs_mean[0],
+            "mode_probs_dc": mode_probs_mean[1],
+            "mode_probs_id": mode_probs_mean[2],
+        }
+
+    def _soft_update(self):
+        for p, p_target in zip(self.critic.parameters(), self.critic_target.parameters()):
+            p_target.data.mul_(1.0 - self.tau)
+            p_target.data.add_(self.tau * p.data)
+
+    def snapshot_state(self) -> dict:
+        return {
+            "ttfe": {k: v.clone() for k, v in self.ttfe.state_dict().items()},
+            "actor": {k: v.clone() for k, v in self.actor.state_dict().items()},
+            "critic": {k: v.clone() for k, v in self.critic.state_dict().items()},
+            "critic_target": {k: v.clone() for k, v in self.critic_target.state_dict().items()},
+        }
+
+    def save_emergency_checkpoint(self, path: str, snapshot: dict):
+        torch.save({"stage": self.stage, "tau_gumbel": self.tau_gumbel, **snapshot}, path)
+
+    def save_checkpoint(self, path: str):
+        torch.save({
+            "stage": self.stage,
+            "tau_gumbel": self.tau_gumbel,
+            "ttfe": self.ttfe.state_dict(),
+            "actor": self.actor.state_dict(),
+            "critic": self.critic.state_dict(),
+            "critic_target": self.critic_target.state_dict(),
+            "ttfe_optimizer": self.ttfe_optimizer.state_dict(),
+            "actor_optimizer": self.actor_optimizer.state_dict(),
+            "critic_optimizer": self.critic_optimizer.state_dict(),
+        }, path)
+
+    def load_checkpoint(self, path: str, weights_only_mode: bool = False):
+        ckpt = torch.load(path, map_location=self.device, weights_only=True)
+        self.ttfe.load_state_dict(ckpt["ttfe"])
+        self.actor.load_state_dict(ckpt["actor"])
+        self.critic.load_state_dict(ckpt["critic"])
+        self.critic_target.load_state_dict(ckpt["critic_target"])
+        if "tau_gumbel" in ckpt:
+            self.tau_gumbel = ckpt["tau_gumbel"]
+        if not weights_only_mode:
+            self.ttfe_optimizer.load_state_dict(ckpt["ttfe_optimizer"])
+            self.actor_optimizer.load_state_dict(ckpt["actor_optimizer"])
+            self.critic_optimizer.load_state_dict(ckpt["critic_optimizer"])

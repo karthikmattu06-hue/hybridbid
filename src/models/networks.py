@@ -6,8 +6,14 @@ Actor: Hybrid discrete-continuous policy.
   - Continuous magnitude via squashed Gaussian
   Matches Li et al. (2024) Eq. 1, 23.
 
-Critic: Twin Q-networks for clipped double-Q learning.
+Critic (standard): Twin Q-networks for clipped double-Q learning.
+
+Critic (Tier 1): BroNetCritic — LayerNorm + residual blocks + HL-Gauss categorical head.
+  Reference: Farebrother et al., "Stop Regressing: Training Value Functions via
+  Classification for Scalable Deep RL", ICML 2024 (arXiv:2403.03950).
 """
+
+import math
 
 import numpy as np
 import torch
@@ -257,4 +263,181 @@ class TwinCritic(nn.Module):
 
     def forward(self, obs: torch.Tensor, action: torch.Tensor):
         """Returns (Q1, Q2) both as (batch, 1)."""
+        return self.q1(obs, action), self.q2(obs, action)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tier 1 critic: BroNet + HL-Gauss categorical head
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class HLGaussLoss:
+    """
+    HL-Gauss: convert scalar regression targets to soft categorical distributions
+    over a fixed support, then use cross-entropy as the critic loss.
+
+    Reference: Farebrother et al., "Stop Regressing: Training Value Functions via
+    Classification for Scalable Deep RL", ICML 2024 (arXiv:2403.03950).
+
+    The support spans [-20, 20] in symlog space.  Since rewards are symlog-
+    transformed before entering the buffer, symlog(return) is bounded: a reward
+    of ±50 symlogs to ±3.9, and even the τ=0.97 infinite-horizon sum is ≤ symlog
+    of the raw sum, which stays well inside ±20 for ERCOT arbitrage.
+
+    Parameters
+    ----------
+    min_value, max_value : float
+        Left and right edges of the support (symlog scale).  Default: [-20, 20].
+    n_atoms : int
+        Number of support atoms.  Default: 101.
+    sigma : float
+        Gaussian smoothing bandwidth (bins).  Default: 0.75.
+    """
+
+    def __init__(
+        self,
+        min_value: float = -20.0,
+        max_value: float = 20.0,
+        n_atoms: int = 101,
+        sigma: float = 0.75,
+    ):
+        self.min_value = min_value
+        self.max_value = max_value
+        self.n_atoms = n_atoms
+        self.sigma = sigma
+        self.support = torch.linspace(min_value, max_value, n_atoms)
+        # Midpoints between consecutive atoms, used as bin boundaries.
+        self._midpoints = 0.5 * (self.support[:-1] + self.support[1:])  # (n_atoms-1,)
+
+    def to(self, device: str) -> "HLGaussLoss":
+        self.support = self.support.to(device)
+        self._midpoints = self._midpoints.to(device)
+        return self
+
+    def transform_to_probs(self, target: torch.Tensor) -> torch.Tensor:
+        """
+        Convert scalar targets to HL-Gauss soft categorical distributions.
+
+        Uses midpoints between adjacent support atoms as bin boundaries.
+        The leftmost bin absorbs mass from -inf; the rightmost from +inf.
+
+        Parameters
+        ----------
+        target : (batch,) float tensor — values in symlog space.
+
+        Returns
+        -------
+        probs : (batch, n_atoms) — non-negative, sums to 1 along dim=-1.
+        """
+        # CDF of N(target, sigma) evaluated at each midpoint: (batch, n_atoms-1)
+        cdf_at_mid = 0.5 * (
+            1.0 + torch.erf(
+                (self._midpoints.unsqueeze(0) - target.unsqueeze(-1))
+                / (math.sqrt(2.0) * self.sigma)
+            )
+        )
+        # Prepend 0 and append 1 to capture boundary mass.
+        zeros = torch.zeros(target.shape[0], 1, device=target.device)
+        ones = torch.ones(target.shape[0], 1, device=target.device)
+        cdf_full = torch.cat([zeros, cdf_at_mid, ones], dim=-1)  # (batch, n_atoms+1)
+        probs = cdf_full[:, 1:] - cdf_full[:, :-1]              # (batch, n_atoms)
+        return probs
+
+    def transform_from_probs(self, probs: torch.Tensor) -> torch.Tensor:
+        """Scalar expectation of the categorical distribution (symlog scale)."""
+        return (probs * self.support.to(probs.device)).sum(dim=-1, keepdim=True)  # (batch, 1)
+
+    def compute_q(self, logits: torch.Tensor):
+        """
+        Convert critic logits to (q_raw, q_symlog).
+
+        q_symlog : expectation over support (symlog scale).
+        q_raw    : symexp(q_symlog) — natural scale, used in actor loss.
+        """
+        probs = F.softmax(logits, dim=-1)
+        q_symlog = self.transform_from_probs(probs)                           # (batch, 1)
+        q_raw = torch.sign(q_symlog) * (torch.exp(torch.abs(q_symlog)) - 1)  # symexp
+        return q_raw, q_symlog
+
+    def loss(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """
+        Cross-entropy loss between predicted logits and HL-Gauss target distribution.
+
+        Parameters
+        ----------
+        logits : (batch, n_atoms)
+        target : (batch,) — scalar values in symlog space.
+
+        Returns
+        -------
+        loss : (batch,) — per-sample cross-entropy.
+        """
+        target_probs = self.transform_to_probs(target)        # (batch, n_atoms)
+        log_pred = F.log_softmax(logits, dim=-1)
+        return -(target_probs * log_pred).sum(dim=-1)         # (batch,)
+
+
+class BroNetCritic(nn.Module):
+    """
+    BroNet-style critic: Entry block + 2 pre-LN residual blocks + HL-Gauss head.
+
+    Returns logits (n_atoms) over the HL-Gauss support — NOT a scalar.
+    Use HLGaussLoss.compute_q() to convert logits to scalar Q estimates.
+
+    Reference architecture from Björck et al. "Is Deep Learning Good for
+    Reinforcement Learning?" (BroNet / LayerNorm critic family).
+    """
+
+    def __init__(
+        self,
+        obs_dim: int = 90,
+        act_dim: int = 4,
+        hidden: int = 512,
+        n_atoms: int = 101,
+    ):
+        super().__init__()
+        self.entry = nn.Sequential(
+            nn.Linear(obs_dim + act_dim, hidden),
+            nn.LayerNorm(hidden),
+            nn.ReLU(),
+        )
+        self.block1 = self._make_block(hidden)
+        self.block2 = self._make_block(hidden)
+        self.head = nn.Linear(hidden, n_atoms)
+        self.n_atoms = n_atoms
+
+    @staticmethod
+    def _make_block(hidden: int) -> nn.Sequential:
+        return nn.Sequential(
+            nn.LayerNorm(hidden),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden),
+        )
+
+    def forward(self, obs: torch.Tensor, act: torch.Tensor) -> torch.Tensor:
+        """Returns logits of shape (batch, n_atoms)."""
+        x = torch.cat([obs, act], dim=-1)
+        h = self.entry(x)
+        h = h + self.block1(h)
+        h = h + self.block2(h)
+        return self.head(h)
+
+
+class TwinBroNetCritic(nn.Module):
+    """Twin BroNet critics for clipped double-Q learning (Tier 1)."""
+
+    def __init__(
+        self,
+        obs_dim: int = 90,
+        action_dim: int = 4,
+        hidden: int = 512,
+        n_atoms: int = 101,
+    ):
+        super().__init__()
+        self.q1 = BroNetCritic(obs_dim, action_dim, hidden, n_atoms)
+        self.q2 = BroNetCritic(obs_dim, action_dim, hidden, n_atoms)
+
+    def forward(self, obs: torch.Tensor, action: torch.Tensor):
+        """Returns (logits_q1, logits_q2), each (batch, n_atoms)."""
         return self.q1(obs, action), self.q2(obs, action)

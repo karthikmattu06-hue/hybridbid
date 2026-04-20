@@ -139,6 +139,52 @@ class Stage1V592Config(Stage1Config):
 
 
 @dataclass
+class Stage1Tier1Config(Stage1Config):
+    """Stage 1 Tier 1: BroNet critic + HL-Gauss loss + fixed alpha + γ=0.97.
+
+    Root cause addressed: scalar-regression critic + Cauchy-tailed ERCOT rewards
+    under γ=0.99 → Q-value explosion → alpha swing → mode collapse.
+
+    Changes from Stage1Config:
+      1. Critic: BroNetCritic (LayerNorm + 2 residual blocks + HL-Gauss head, hidden=512)
+      2. Critic loss: HL-Gauss cross-entropy over 101-bin symlog support [-20, 20]
+      3. Critic optimizer: AdamW lr=1e-4, weight_decay=0.1
+      4. gamma: 0.99 → 0.97 (effective horizon ~33 steps @ 5-min resolution)
+      5. alpha: 0.1 fixed (no auto-tuning; removes Q-swing → alpha-swing feedback)
+      6. tau: 0.005 → 0.001 (slower target update contains spike propagation)
+      7. Critic grad clip: max_norm=1.0 on combined critic params
+      8. idle_logit_bonus=0.0, alpha_max=inf (v5.9.2 band-aids removed)
+    """
+    # BroNet hidden dim (larger than standard 256)
+    hidden_dim: int = 512
+
+    # Critic optimizer
+    lr_critic: float = 1e-4
+    weight_decay_critic: float = 0.1  # AdamW weight decay
+
+    # HL-Gauss categorical head
+    n_atoms: int = 101
+    hl_gauss_min: float = -20.0
+    hl_gauss_max: float = 20.0
+    hl_gauss_sigma: float = 0.75
+
+    # SAC hyperparams (Changes 4–6)
+    gamma: float = 0.97
+    alpha_fixed: float = 0.1          # fixed entropy temperature
+    tau: float = 0.001
+
+    # Remove v5.9.2 band-aids (Change 8)
+    alpha_max: float = float("inf")
+    idle_logit_bonus: float = 0.0
+    max_grad_norm_critic: float = None  # type: ignore[assignment]  # unified clip
+
+    # Run config
+    total_steps: int = 500_000
+    checkpoint_dir: str = "checkpoints/stage1_tier1_v1"
+    log_interval: int = 1_000
+
+
+@dataclass
 class Stage2Config(TrainConfig):
     """Stage 2: Post-RTC+B co-optimization fine-tuning (stage2_v2).
 
