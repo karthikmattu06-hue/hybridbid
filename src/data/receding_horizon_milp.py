@@ -143,6 +143,7 @@ def generate_trajectory(
     commit_hours: int = 1,
     solver: str = None,
     split_name: str = "unknown",
+    time_limit: float = 5.0,
 ) -> dict:
     """
     Roll out the receding-horizon MILP expert over a price series.
@@ -212,12 +213,38 @@ def generate_trajectory(
             soc_initial=current_soc,
             solver=solver,
             verbose=False,
+            time_limit=time_limit,
         )
         solve_times.append(time.time() - t_solve)
 
-        if result["status"] not in ["optimal", "optimal_inaccurate"]:
+        if result["status"] not in ["optimal", "optimal_inaccurate", "user_limit", "user_limit_inaccurate"]:
             n_failed += 1
+            logger.warning(
+                f"  window t={t} status={result['status']} — "
+                f"no feasible solution within time_limit={time_limit}s, "
+                f"idling {min(commit_steps, remaining)} steps"
+            )
             # Fall back to idle for this commit window
+            commit_this = min(commit_steps, remaining)
+            for i in range(commit_this):
+                modes[t + i] = 2
+                magnitudes[t + i] = 0.0
+                socs[t + i] = current_soc
+                rt = float(price_arr[t + i])
+                ema_price = EMA_TAU * ema_price + (1.0 - EMA_TAU) * rt
+                rewards_env[t + i] = 0.0
+                rewards_raw[t + i] = 0.0
+            t += commit_this
+            continue
+
+        # If the result is a time-limit solve, the arrays are still present but
+        # may be missing (None). Guard against that before committing actions.
+        if result.get("p_charge") is None or result.get("p_discharge") is None:
+            n_failed += 1
+            logger.warning(
+                f"  window t={t} status={result['status']} — "
+                f"solver returned no solution arrays, idling"
+            )
             commit_this = min(commit_steps, remaining)
             for i in range(commit_this):
                 modes[t + i] = 2
@@ -446,6 +473,8 @@ def main():
                         help="Commit window in hours (default: 1)")
     parser.add_argument("--solver", type=str, default=None,
                         help="CVXPY solver (default: auto-select)")
+    parser.add_argument("--time-limit", type=float, default=5.0,
+                        help="Per-window solver time limit in seconds (default: 5.0)")
     parser.add_argument("--out", type=str, default="data/expert_trajectories",
                         help="Output directory")
     args = parser.parse_args()
@@ -469,6 +498,7 @@ def main():
             commit_hours=args.commit,
             solver=args.solver,
             split_name=split,
+            time_limit=args.time_limit,
         )
 
         out_path = Path(args.out) / f"receding_horizon_{split}.npz"
