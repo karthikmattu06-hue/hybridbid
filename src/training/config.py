@@ -220,6 +220,54 @@ class Stage1Tier2aConfig(Stage1Tier1Config):
 
 
 @dataclass
+class Stage1Tier2cConfig(Stage1Tier2aConfig):
+    """Stage 1 Tier 2c: offline IQL on MILP expert trajectories (Option D path b).
+
+    Paper-standard IQL (Kostrikov et al., ICLR 2022, arXiv:2110.06169), no tuning:
+      - Expectile τ = 0.9, β_advantage = 5.0
+      - γ = 0.97, AdamW lr = 3e-4, weight_decay = 0.01
+      - Batch size 256, 200k total gradient steps
+      - Eval every 25k; mandatory process-level pause at 50k for user review
+      - Polyak τ = 0.005 on **target V only** (Q has no target)
+      - Advantage-weight clip = 100.0
+      - Reward pre-scale: symlog(r / 100)
+
+    Trajectories: preprocessed from MILP expert via `scripts/preprocess_milp_option_d.py`:
+      - train: 420,423 transitions (2020-01-01 → 2023-12-31)
+      - val:   183,871 transitions (2024-01-01 → 2025-09-30)
+      - Actions: 7-atom discrete lattice (98% mass on atoms 0, 3, 6)
+      - Dones: all False; truncateds at UTC-date boundaries (1,460 in train)
+      - Rewards ≡ MILP.rewards_env (zero mismatch by construction)
+
+    TTFE ownership: V-head owns TTFE gradient (actor + Q use detached encoding),
+    mirroring the Tier 1 / Tier 2a ownership pattern.
+    """
+    # IQL-specific hyperparameters
+    expectile_tau: float = 0.9
+    beta_advantage: float = 5.0
+    awr_weight_clip: float = 100.0
+    polyak_tau: float = 0.005
+
+    # Optimizer — unified IQL lr/wd across all four heads
+    lr: float = 3e-4
+    weight_decay: float = 0.01
+
+    # Offline run config
+    batch_size: int = 256
+    total_steps: int = 200_000
+    pause_step: int = 50_000        # non-negotiable process-level halt
+    eval_interval: int = 25_000
+    log_interval: int = 1_000
+    save_every: int = 25_000
+
+    # Trajectory paths (produced by preprocess_milp_option_d.py)
+    train_npz: str = "data/expert_trajectories/receding_horizon_train_option_d.npz"
+    val_npz:   str = "data/expert_trajectories/receding_horizon_val_option_d.npz"
+
+    checkpoint_dir: str = "checkpoints/tier2c_seed42"
+
+
+@dataclass
 class Stage2Config(TrainConfig):
     """Stage 2: Post-RTC+B co-optimization fine-tuning (stage2_v2).
 
