@@ -21,8 +21,10 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
 from src.env.ercot_env import ERCOTBatteryEnv
-from src.models.sac import SACAgent, SACAgentTier1
-from src.training.config import Stage1Config, Stage1V60Config, Stage1Tier1Config
+from src.models.sac import SACAgent, SACAgentTier1, SACAgentTier2a
+from src.training.config import (
+    Stage1Config, Stage1V60Config, Stage1Tier1Config, Stage1Tier2aConfig,
+)
 
 # Baselines from CLAUDE.md (pre-RTC+B, $/day for 10 MW / 20 MWh battery)
 TBEX_DAILY = 870.0
@@ -38,7 +40,8 @@ def evaluate(checkpoint_path: str, config: Stage1Config = None, verbose: bool = 
         config = Stage1Config()
 
     enriched = isinstance(config, Stage1V60Config)
-    tier1 = isinstance(config, Stage1Tier1Config)
+    tier2a = isinstance(config, Stage1Tier2aConfig)
+    tier1 = isinstance(config, Stage1Tier1Config) and not tier2a
 
     # --- Environment (test set, deterministic) ---
     battery_config = dict(
@@ -59,7 +62,19 @@ def evaluate(checkpoint_path: str, config: Stage1Config = None, verbose: bool = 
     n_days = len(env.day_starts)
 
     # --- Agent ---
-    if tier1:
+    if tier2a:
+        agent = SACAgentTier2a(
+            device=config.device,
+            n_prices=config.n_prices,
+            d_model=config.d_model,
+            nhead=config.nhead,
+            n_layers=config.n_layers,
+            seq_len=config.seq_len,
+            static_dim=config.static_dim,
+            hidden_dim=config.hidden_dim,
+            n_actions=config.n_actions,
+        )
+    elif tier1:
         agent = SACAgentTier1(
             stage=1,
             device=config.device,
@@ -108,7 +123,10 @@ def evaluate(checkpoint_path: str, config: Stage1Config = None, verbose: bool = 
         done         = False
 
         while not done:
-            action = agent.select_action(obs, deterministic=True)
+            if tier2a:
+                action, _idx = agent.select_action(obs, deterministic=True)
+            else:
+                action = agent.select_action(obs, deterministic=True)
             obs, _reward, terminated, truncated, info = env.step(action)
 
             # Actual $ revenue = p.u. energy_revenue × P_max
@@ -197,9 +215,15 @@ if __name__ == "__main__":
         "--tier1", action="store_true",
         help="Use Stage1Tier1Config (BroNet critic, hidden_dim=512, HL-Gauss)",
     )
+    parser.add_argument(
+        "--tier2a", action="store_true",
+        help="Use Stage1Tier2aConfig (discrete N=7 categorical actions atop Tier 1 stack)",
+    )
     args = parser.parse_args()
 
-    if args.tier1:
+    if args.tier2a:
+        cfg = Stage1Tier2aConfig()
+    elif args.tier1:
         cfg = Stage1Tier1Config()
     elif args.v60:
         cfg = Stage1V60Config()

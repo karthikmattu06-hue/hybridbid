@@ -441,3 +441,157 @@ class TwinBroNetCritic(nn.Module):
     def forward(self, obs: torch.Tensor, action: torch.Tensor):
         """Returns (logits_q1, logits_q2), each (batch, n_atoms)."""
         return self.q1(obs, action), self.q2(obs, action)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tier 2a: Discrete N=7 actor + BroNet/HL-Gauss Q(s)→[N, n_atoms] critic
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Discrete action grid (Tier 2a): 7 levels in p.u. of P_max.
+# Negative = charge, positive = discharge, 0 = idle.
+TIER2A_ACTION_LEVELS = [-1.0, -2.0 / 3.0, -1.0 / 3.0, 0.0, 1.0 / 3.0, 2.0 / 3.0, 1.0]
+TIER2A_N_ACTIONS = 7
+
+
+def tier2a_idx_to_env_action(idx: int) -> np.ndarray:
+    """
+    Map a discrete action index (0..6) to the 4D env action format
+    `[mode_onehot(3), energy_mag(1)]` expected by ercot_env.py.
+
+    Idx → level mapping:
+      0: -P_max   → charge,    mag=1.0
+      1: -2P/3    → charge,    mag=2/3
+      2: -P/3     → charge,    mag=1/3
+      3:  0       → idle,      mag=0.0
+      4: +P/3     → discharge, mag=1/3
+      5: +2P/3    → discharge, mag=2/3
+      6: +P_max   → discharge, mag=1.0
+    """
+    level = TIER2A_ACTION_LEVELS[idx]
+    mode_onehot = np.zeros(3, dtype=np.float32)
+    if level < 0:
+        mode_onehot[MODE_CHARGE] = 1.0
+    elif level > 0:
+        mode_onehot[MODE_DISCHARGE] = 1.0
+    else:
+        mode_onehot[MODE_IDLE] = 1.0
+    mag = abs(level)
+    return np.concatenate([mode_onehot, [mag]]).astype(np.float32)
+
+
+# Pre-materialize the (7, 4) translation table for fast batched sim lookups.
+TIER2A_IDX_TO_ENV_ACTION = np.stack(
+    [tier2a_idx_to_env_action(i) for i in range(TIER2A_N_ACTIONS)]
+).astype(np.float32)
+
+
+class ActorDiscrete7(nn.Module):
+    """
+    Discrete SAC actor: Categorical over 7 action levels.
+
+    No Gumbel-Softmax, no continuous magnitude, no reparameterization. Outputs
+    raw logits; the SAC update consumes the full softmax distribution to form
+    closed-form expectations over the action space.
+
+    Input : obs (batch, obs_dim)
+    Output: logits (batch, 7)
+    """
+
+    def __init__(self, obs_dim: int = 90, hidden_dim: int = 512,
+                 n_actions: int = TIER2A_N_ACTIONS):
+        super().__init__()
+        self.obs_dim = obs_dim
+        self.n_actions = n_actions
+        self.fc1 = nn.Linear(obs_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.logit_head = nn.Linear(hidden_dim, n_actions)
+
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        h = F.relu(self.fc1(obs))
+        h = F.relu(self.fc2(h))
+        return self.logit_head(h)
+
+    def sample(self, obs: torch.Tensor, deterministic: bool = False):
+        """
+        Returns
+        -------
+        action_idx    : (batch,) long — sampled (or argmax) action index.
+        log_probs_all : (batch, n_actions) — full distribution log-probs.
+        probs_all     : (batch, n_actions) — full softmax.
+        """
+        logits = self.forward(obs)
+        log_probs_all = F.log_softmax(logits, dim=-1)
+        probs_all = log_probs_all.exp()
+        if deterministic:
+            action_idx = logits.argmax(dim=-1)
+        else:
+            action_idx = torch.distributions.Categorical(probs=probs_all).sample()
+        return action_idx, log_probs_all, probs_all
+
+
+class DiscreteBroNetCritic(nn.Module):
+    """
+    BroNet-style critic for Tier 2a: Q(s) → logits of shape (batch, N, n_atoms).
+
+    Entry block + 2 pre-LN residual blocks + head that emits N * n_atoms logits,
+    reshaped to (batch, N, n_atoms). Each slice along dim=1 is an independent
+    HL-Gauss distribution over the same symlog support.
+
+    Input: obs only — no action. This removes the `∂Q/∂a` symexp-amplification
+    path that was the surviving spike driver in Tier 1 v2.1.
+    """
+
+    def __init__(
+        self,
+        obs_dim: int = 90,
+        n_actions: int = TIER2A_N_ACTIONS,
+        hidden: int = 512,
+        n_atoms: int = 101,
+    ):
+        super().__init__()
+        self.n_actions = n_actions
+        self.n_atoms = n_atoms
+        self.entry = nn.Sequential(
+            nn.Linear(obs_dim, hidden),
+            nn.LayerNorm(hidden),
+            nn.ReLU(),
+        )
+        self.block1 = self._make_block(hidden)
+        self.block2 = self._make_block(hidden)
+        self.head = nn.Linear(hidden, n_actions * n_atoms)
+
+    @staticmethod
+    def _make_block(hidden: int) -> nn.Sequential:
+        return nn.Sequential(
+            nn.LayerNorm(hidden),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden),
+        )
+
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        """Returns logits of shape (batch, n_actions, n_atoms)."""
+        h = self.entry(obs)
+        h = h + self.block1(h)
+        h = h + self.block2(h)
+        flat = self.head(h)                                        # (batch, N*A)
+        return flat.view(-1, self.n_actions, self.n_atoms)
+
+
+class TwinDiscreteBroNetCritic(nn.Module):
+    """Twin discrete BroNet critics for clipped double-Q (Tier 2a)."""
+
+    def __init__(
+        self,
+        obs_dim: int = 90,
+        n_actions: int = TIER2A_N_ACTIONS,
+        hidden: int = 512,
+        n_atoms: int = 101,
+    ):
+        super().__init__()
+        self.q1 = DiscreteBroNetCritic(obs_dim, n_actions, hidden, n_atoms)
+        self.q2 = DiscreteBroNetCritic(obs_dim, n_actions, hidden, n_atoms)
+
+    def forward(self, obs: torch.Tensor):
+        """Returns (logits_q1, logits_q2), each (batch, n_actions, n_atoms)."""
+        return self.q1(obs), self.q2(obs)

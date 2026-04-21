@@ -196,6 +196,30 @@ class Stage1Tier1Config(Stage1Config):
 
 
 @dataclass
+class Stage1Tier2aConfig(Stage1Tier1Config):
+    """Stage 1 Tier 2a: discrete N=7 categorical action space atop Tier 1 stack.
+
+    Replaces the Gumbel-Softmax mode + squashed-Gaussian magnitude head with a
+    single Categorical over 7 action levels in p.u. of P_max:
+        {-P, -2P/3, -P/3, 0, +P/3, +2P/3, +P}
+
+    Critic is rebuilt as Q(s) → (batch, N, n_atoms) with no action input, which
+    removes the `∂Q/∂a` symexp-amplification path identified as the residual
+    spike driver in Tier 1 v2.1.
+
+    All other Tier 1 choices unchanged (BroNet, HL-Gauss, reward prescale ÷100,
+    stop-gradient on actor→TTFE, fixed α=0.1, γ=0.97, τ=0.001, AdamW wd=0.1).
+    """
+    # Discrete action config
+    n_actions: int = 7
+
+    # Run config
+    checkpoint_dir: str = "checkpoints/tier2a_seed42"
+    save_every: int = 25_000     # mandatory checkpoint every 25k (eval cadence)
+    log_interval: int = 1_000
+
+
+@dataclass
 class Stage2Config(TrainConfig):
     """Stage 2: Post-RTC+B co-optimization fine-tuning (stage2_v2).
 
