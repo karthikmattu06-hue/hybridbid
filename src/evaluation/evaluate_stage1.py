@@ -21,8 +21,8 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
 from src.env.ercot_env import ERCOTBatteryEnv
-from src.models.sac import SACAgent
-from src.training.config import Stage1Config, Stage1V60Config
+from src.models.sac import SACAgent, SACAgentTier1
+from src.training.config import Stage1Config, Stage1V60Config, Stage1Tier1Config
 
 # Baselines from CLAUDE.md (pre-RTC+B, $/day for 10 MW / 20 MWh battery)
 TBEX_DAILY = 870.0
@@ -38,6 +38,7 @@ def evaluate(checkpoint_path: str, config: Stage1Config = None, verbose: bool = 
         config = Stage1Config()
 
     enriched = isinstance(config, Stage1V60Config)
+    tier1 = isinstance(config, Stage1Tier1Config)
 
     # --- Environment (test set, deterministic) ---
     battery_config = dict(
@@ -58,19 +59,33 @@ def evaluate(checkpoint_path: str, config: Stage1Config = None, verbose: bool = 
     n_days = len(env.day_starts)
 
     # --- Agent ---
-    agent = SACAgent(
-        stage=1,
-        device=config.device,
-        n_prices=config.n_prices,
-        n_prices_flat=getattr(config, "n_prices_flat", None),
-        d_model=config.d_model,
-        nhead=config.nhead,
-        n_layers=config.n_layers,
-        seq_len=config.seq_len,
-        static_dim=config.static_dim,
-        hidden_dim=config.hidden_dim,
-        tau_gumbel=config.tau_gumbel_final,  # fully annealed = deterministic
-    )
+    if tier1:
+        agent = SACAgentTier1(
+            stage=1,
+            device=config.device,
+            n_prices=config.n_prices,
+            d_model=config.d_model,
+            nhead=config.nhead,
+            n_layers=config.n_layers,
+            seq_len=config.seq_len,
+            static_dim=config.static_dim,
+            hidden_dim=config.hidden_dim,
+            tau_gumbel=config.tau_gumbel_final,
+        )
+    else:
+        agent = SACAgent(
+            stage=1,
+            device=config.device,
+            n_prices=config.n_prices,
+            n_prices_flat=getattr(config, "n_prices_flat", None),
+            d_model=config.d_model,
+            nhead=config.nhead,
+            n_layers=config.n_layers,
+            seq_len=config.seq_len,
+            static_dim=config.static_dim,
+            hidden_dim=config.hidden_dim,
+            tau_gumbel=config.tau_gumbel_final,  # fully annealed = deterministic
+        )
     agent.load_checkpoint(checkpoint_path)
 
     if verbose:
@@ -178,9 +193,18 @@ if __name__ == "__main__":
         "--v60", action="store_true",
         help="Use Stage1V60Config (enriched obs: 36-dim TTFE + 18 price features, obs_dim=108)",
     )
+    parser.add_argument(
+        "--tier1", action="store_true",
+        help="Use Stage1Tier1Config (BroNet critic, hidden_dim=512, HL-Gauss)",
+    )
     args = parser.parse_args()
 
-    cfg = Stage1V60Config() if args.v60 else Stage1Config()
+    if args.tier1:
+        cfg = Stage1Tier1Config()
+    elif args.v60:
+        cfg = Stage1V60Config()
+    else:
+        cfg = Stage1Config()
     if args.device:
         cfg.device = args.device
 

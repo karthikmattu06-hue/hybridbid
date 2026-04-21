@@ -414,7 +414,8 @@ class SACAgent:
             "alpha_optimizer": self.alpha_optimizer.state_dict(),
         }, path)
 
-    def load_checkpoint(self, path: str, weights_only_mode: bool = False):
+    def load_checkpoint(self, path: str, weights_only_mode: bool = False,
+                        reset_optimizers: bool = False):
         """Load model weights and (optionally) optimizer states.
 
         Parameters
@@ -423,6 +424,10 @@ class SACAgent:
             If True, load only model weights (TTFE, actor, critic). Skip optimizer
             states. Use for evaluation, or when optimizer param groups may not match
             the current agent config (e.g. Phase B checkpoints with partial TTFE).
+        reset_optimizers : bool
+            If True, load model weights but leave Adam optimizer moments fresh
+            (zero state). Used on resume after a gradient-topology change to purge
+            stale momentum.
         """
         ckpt = torch.load(path, map_location=self.device, weights_only=True)
         self.ttfe.load_state_dict(ckpt["ttfe"])
@@ -432,7 +437,7 @@ class SACAgent:
         self.log_alpha.data.copy_(ckpt["log_alpha"])
         if "tau_gumbel" in ckpt:
             self.tau_gumbel = ckpt["tau_gumbel"]
-        if not weights_only_mode:
+        if not weights_only_mode and not reset_optimizers:
             self.ttfe_optimizer.load_state_dict(ckpt["ttfe_optimizer"])
             self.actor_optimizer.load_state_dict(ckpt["actor_optimizer"])
             self.critic_optimizer.load_state_dict(ckpt["critic_optimizer"])
@@ -691,29 +696,49 @@ class SACAgentTier1:
                 next_q_symlog - self.alpha * next_log_probs
             )  # (batch, 1)
 
-        q1_logits, q2_logits = self.critic(obs_encoded.detach(), actions)
+        # NOTE (Tier 1 v2 fix): obs_encoded is NOT detached here — TTFE receives
+        # gradient from critic loss. This replaces the earlier design where TTFE
+        # was updated from actor loss only. Diagnostic on the Narnia tier1_seed42
+        # run showed actor→TTFE gradient flow drove a feedback loop of mega-spikes
+        # (grad_a_pre up to 13,118 at step 145k). Reward pre-scaling ÷100 contains
+        # the historic critic-side Q amplification path.
+        q1_logits, q2_logits = self.critic(obs_encoded, actions)
         target_1d = target_symlog.squeeze(-1)  # (batch,) for HL-Gauss
         critic1_loss = self.hl_gauss.loss(q1_logits, target_1d).mean()
         critic2_loss = self.hl_gauss.loss(q2_logits, target_1d).mean()
         critic_loss = critic1_loss + critic2_loss
 
         self.critic_optimizer.zero_grad()
+        self.ttfe_optimizer.zero_grad()   # TTFE co-updates with critic now
         critic_loss.backward()
+        # TTFE grad logging + clip (moved here from actor section with the v2 fix)
+        grad_ttfe_proj = _grad_norm(
+            [self.ttfe.input_proj.weight, self.ttfe.input_proj.bias, self.ttfe.pos_embedding]
+        )
+        grad_ttfe_attn = _grad_norm(self.ttfe.transformer.parameters())
+        ttfe_grad_norm = nn.utils.clip_grad_norm_(self.ttfe.parameters(), self.max_grad_norm_ttfe)
         # Combined clip across both sub-critics
         all_critic_params = list(self.critic.q1.parameters()) + list(self.critic.q2.parameters())
         critic_grad_norm = nn.utils.clip_grad_norm_(all_critic_params, max_norm=self.max_grad_norm)
         grad_c_pre_clip = critic_grad_norm.item()
         grad_c_post_clip = min(grad_c_pre_clip, self.max_grad_norm)
         self.critic_optimizer.step()
+        self.ttfe_optimizer.step()
 
-        # NaN check
+        # NaN check: critic + TTFE
         nan_found, nan_name = has_nan_params(self.critic)
         if nan_found:
             return {"nan_detected": True, "nan_source": f"critic.{nan_name}"}
+        nan_found, nan_name = has_nan_params(self.ttfe)
+        if nan_found:
+            return {"nan_detected": True, "nan_source": f"ttfe.{nan_name}"}
 
-        # ── Actor + TTFE update ──────────────────────────────────────────────
-        # TTFE updated only via actor gradient (not critic path — avoids Q-amplification).
-        new_actions, log_probs, _ = self.actor.sample(obs_encoded, tau=tau_gumbel, hard=False)
+        # ── Actor update ─────────────────────────────────────────────────────
+        # Stop-gradient on obs_encoded: actor loss must not flow back into TTFE.
+        # This is the core Tier 1 v2 fix — breaks the feedback loop where an
+        # outlier Q transition amplified through symexp corrupted TTFE attention
+        # weights, which then produced noisier obs for the next step's actor.
+        new_actions, log_probs, _ = self.actor.sample(obs_encoded.detach(), tau=tau_gumbel, hard=False)
         mode_probs_mean = new_actions[:, :3].mean(dim=0).detach().cpu().tolist()
 
         q1_new_logits, q2_new_logits = self.critic(obs_encoded.detach(), new_actions)
@@ -730,25 +755,15 @@ class SACAgentTier1:
         actor_loss = (self.alpha * log_probs - q_new).mean()
 
         self.actor_optimizer.zero_grad()
-        self.ttfe_optimizer.zero_grad()
         actor_loss.backward()
         actor_grad_norm = nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
         grad_a_pre_clip = actor_grad_norm.item()
         grad_a_post_clip = min(grad_a_pre_clip, self.max_grad_norm)
-        grad_ttfe_proj = _grad_norm(
-            [self.ttfe.input_proj.weight, self.ttfe.input_proj.bias, self.ttfe.pos_embedding]
-        )
-        grad_ttfe_attn = _grad_norm(self.ttfe.transformer.parameters())
-        ttfe_grad_norm = nn.utils.clip_grad_norm_(self.ttfe.parameters(), self.max_grad_norm_ttfe)
         self.actor_optimizer.step()
-        self.ttfe_optimizer.step()
 
         nan_found, nan_name = has_nan_params(self.actor)
         if nan_found:
             return {"nan_detected": True, "nan_source": f"actor.{nan_name}"}
-        nan_found, nan_name = has_nan_params(self.ttfe)
-        if nan_found:
-            return {"nan_detected": True, "nan_source": f"ttfe.{nan_name}"}
 
         # ── Soft update target ───────────────────────────────────────────────
         self._soft_update()
@@ -764,6 +779,13 @@ class SACAgentTier1:
             _, q1_symlog = self.hl_gauss.compute_q(q1_logits.detach())
             _, q2_symlog = self.hl_gauss.compute_q(q2_logits.detach())
             q_symlog_mean = torch.min(q1_symlog, q2_symlog).mean().item()
+
+            # Batch RT-LMP distribution (raw $/MWh) — for spike correlation.
+            # ph shape: (batch, seq_len, 12); col 0 is RT LMP.
+            rt_lmp_batch = ph[..., 0]                         # (batch, seq_len)
+            batch_price_max = rt_lmp_batch.max().item()
+            batch_price_n_gt_2k = (rt_lmp_batch > 2000.0).sum().item()
+            batch_price_n_gt_5k = (rt_lmp_batch > 5000.0).sum().item()
 
         return {
             "critic_loss": critic_loss.item(),
@@ -792,6 +814,10 @@ class SACAgentTier1:
             "mode_probs_ch": mode_probs_mean[0],
             "mode_probs_dc": mode_probs_mean[1],
             "mode_probs_id": mode_probs_mean[2],
+            # Batch RT-LMP distribution (for spike-vs-price correlation)
+            "batch_price_max": batch_price_max,
+            "batch_price_n_gt_2k": batch_price_n_gt_2k,
+            "batch_price_n_gt_5k": batch_price_n_gt_5k,
         }
 
     def _soft_update(self):
@@ -823,7 +849,8 @@ class SACAgentTier1:
             "critic_optimizer": self.critic_optimizer.state_dict(),
         }, path)
 
-    def load_checkpoint(self, path: str, weights_only_mode: bool = False):
+    def load_checkpoint(self, path: str, weights_only_mode: bool = False,
+                        reset_optimizers: bool = False):
         ckpt = torch.load(path, map_location=self.device, weights_only=True)
         self.ttfe.load_state_dict(ckpt["ttfe"])
         self.actor.load_state_dict(ckpt["actor"])
@@ -831,7 +858,10 @@ class SACAgentTier1:
         self.critic_target.load_state_dict(ckpt["critic_target"])
         if "tau_gumbel" in ckpt:
             self.tau_gumbel = ckpt["tau_gumbel"]
-        if not weights_only_mode:
+        # reset_optimizers: load weights only; leave Adam moments fresh (zero state).
+        # Used on resume after an architectural change (e.g., stop-gradient fix) to
+        # purge stale momentum accumulated under the old gradient topology.
+        if not weights_only_mode and not reset_optimizers:
             self.ttfe_optimizer.load_state_dict(ckpt["ttfe_optimizer"])
             self.actor_optimizer.load_state_dict(ckpt["actor_optimizer"])
             self.critic_optimizer.load_state_dict(ckpt["critic_optimizer"])

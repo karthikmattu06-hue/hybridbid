@@ -30,7 +30,9 @@ from src.models.sac import SACAgent, SACAgentTier1
 from src.training.config import Stage1Config, Stage1V60Config, Stage1V592Config, Stage1Tier1Config
 
 
-def train_stage1(config: Stage1Config = None, enriched_obs: bool = False):
+def train_stage1(config: Stage1Config = None, enriched_obs: bool = False,
+                 resume_from: str = None, resume_step: int = 0,
+                 reset_optimizers: bool = False):
     if config is None:
         config = Stage1Config()
 
@@ -150,12 +152,34 @@ def train_stage1(config: Stage1Config = None, enriched_obs: bool = False):
     # Gumbel temperature annealing schedule
     tau_gumbel_range = config.tau_gumbel_init - config.tau_gumbel_final
 
+    # Resume from checkpoint (network + optimizer state; replay buffer starts empty)
+    if resume_from is not None:
+        print(f"Resuming from checkpoint: {resume_from} at step {resume_step}")
+        if reset_optimizers:
+            print("  reset_optimizers=True — loading weights only; Adam moments reset to zero")
+        agent.load_checkpoint(resume_from, reset_optimizers=reset_optimizers)
+        # tau_gumbel is restored from checkpoint; override with scheduled value
+        # in case checkpoint predates the current schedule.
+        frac_resume = min(1.0, resume_step / max(config.total_steps, 1))
+        agent.tau_gumbel = config.tau_gumbel_init - frac_resume * tau_gumbel_range
+        print(f"  tau_gumbel set to {agent.tau_gumbel:.4f} (step {resume_step})")
+
+        # Confirm Adam state is fresh if reset was requested
+        if reset_optimizers:
+            def _n_state_entries(optim):
+                return sum(len(v) for v in optim.state_dict()["state"].values())
+            ttfe_n = _n_state_entries(agent.ttfe_optimizer)
+            actor_n = _n_state_entries(agent.actor_optimizer)
+            critic_n = _n_state_entries(agent.critic_optimizer)
+            print(f"  Adam state entries per param group (should be 0 pre-first-step): "
+                  f"ttfe={ttfe_n} actor={actor_n} critic={critic_n}")
+
     # Training loop
     obs, _ = env.reset()
     episode_reward = 0.0      # symlog-transformed (what the agent trains on)
     episode_raw_reward = 0.0  # pre-symlog (for comparison with v5.7/v5.8)
     episode_count = 0
-    step = 0
+    step = resume_step
     log_interval = config.log_interval
     save_interval = config.save_every
     t_start = time.time()
@@ -309,6 +333,15 @@ def train_stage1(config: Stage1Config = None, enriched_obs: bool = False):
                     f" q_exp_mean={metrics.get('q_expected_mean', 0):.2f}"
                     f" q_exp_maxabs={metrics.get('q_expected_max_abs', 0):.1f}"
                 )
+                # Spike-gated ERCOT price diagnostic (v2.1): only log batch price
+                # distribution when grad_a_pre > 50 — characterizes secondary
+                # amplification path without polluting normal logs.
+                if metrics.get("grad_a_pre_clip", 0) > 50.0:
+                    tier1_str += (
+                        f" | SPIKE batch_price_max=${metrics.get('batch_price_max', 0):.0f}"
+                        f" n>2k={metrics.get('batch_price_n_gt_2k', 0)}"
+                        f" n>5k={metrics.get('batch_price_n_gt_5k', 0)}"
+                    )
                 print(
                     f"Step {step:>7d}/{config.total_steps} | "
                     f"ep={episode_count} | "
@@ -418,6 +451,13 @@ if __name__ == "__main__":
     )
     parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility")
     parser.add_argument("--checkpoint-dir", type=str, default=None, help="Override checkpoint directory")
+    parser.add_argument("--resume", type=str, default=None,
+                        help="Resume from checkpoint path (e.g., checkpoints/x/checkpoint_step50000.pt)")
+    parser.add_argument("--resume-step", type=int, default=0,
+                        help="Step counter to resume at; drives tau_gumbel anneal and save intervals")
+    parser.add_argument("--reset-optimizers", action="store_true",
+                        help="Resume model weights only; reset Adam optimizer moments to zero. "
+                             "Use after a gradient-topology change to purge stale momentum.")
     args = parser.parse_args()
 
     # Set seed before anything else
@@ -452,4 +492,6 @@ if __name__ == "__main__":
     if args.checkpoint_dir is not None:
         config.checkpoint_dir = args.checkpoint_dir
 
-    train_stage1(config, enriched_obs=args.v60)
+    train_stage1(config, enriched_obs=args.v60,
+                 resume_from=args.resume, resume_step=args.resume_step,
+                 reset_optimizers=args.reset_optimizers)
