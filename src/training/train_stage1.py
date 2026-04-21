@@ -369,7 +369,7 @@ def train_stage1(config: Stage1Config = None, enriched_obs: bool = False,
                 mode_pct_charge = mode_pct_discharge = mode_pct_idle = 0.0
             mode_counts = {0: 0, 1: 0, 2: 0}  # reset window
 
-            gumbel_temperature = agent.tau_gumbel
+            gumbel_temperature = getattr(agent, "tau_gumbel", 0.0)  # 0 for Tier 2a (no Gumbel)
 
             # Check for NaN in metrics values (belt-and-suspenders with param check)
             has_nan = any(
