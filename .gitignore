@@ -38,3 +38,4 @@ build/
 
 # Gurobi
 gurobi.lic
+data/expert_trajectories/
