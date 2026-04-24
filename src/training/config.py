@@ -139,6 +139,135 @@ class Stage1V592Config(Stage1Config):
 
 
 @dataclass
+class Stage1Tier1Config(Stage1Config):
+    """Stage 1 Tier 1: BroNet critic + HL-Gauss loss + fixed alpha + γ=0.97.
+
+    Root cause addressed: scalar-regression critic + Cauchy-tailed ERCOT rewards
+    under γ=0.99 → Q-value explosion → alpha swing → mode collapse.
+
+    Changes from Stage1Config:
+      1. Critic: BroNetCritic (LayerNorm + 2 residual blocks + HL-Gauss head, hidden=512)
+      2. Critic loss: HL-Gauss cross-entropy over 101-bin symlog support [-20, 20]
+      3. Critic optimizer: AdamW lr=1e-4, weight_decay=0.1
+      4. gamma: 0.99 → 0.97 (effective horizon ~33 steps @ 5-min resolution)
+      5. alpha: 0.1 fixed (no auto-tuning; removes Q-swing → alpha-swing feedback)
+      6. tau: 0.005 → 0.001 (slower target update contains spike propagation)
+      7. Critic grad clip: max_norm=1.0 on combined critic params
+      8. idle_logit_bonus=0.0, alpha_max=inf (v5.9.2 band-aids removed)
+    """
+    # BroNet hidden dim (larger than standard 256)
+    hidden_dim: int = 512
+
+    # Critic optimizer
+    lr_critic: float = 1e-4
+    weight_decay_critic: float = 0.1  # AdamW weight decay
+
+    # HL-Gauss categorical head
+    n_atoms: int = 101
+    hl_gauss_min: float = -20.0
+    hl_gauss_max: float = 20.0
+    hl_gauss_sigma: float = 0.75
+
+    # SAC hyperparams (Changes 4–6)
+    gamma: float = 0.97
+    alpha_fixed: float = 0.1          # fixed entropy temperature
+    tau: float = 0.001
+
+    # Remove v5.9.2 band-aids (Change 8)
+    alpha_max: float = float("inf")
+    idle_logit_bonus: float = 0.0
+    max_grad_norm_critic: float = None  # type: ignore[assignment]  # unified clip
+
+    # Reward pre-scaling: divide raw $ reward by REWARD_SCALE before symlog.
+    # ERCOT rewards span $0–1500 normally (spikes to $10k+). At REWARD_SCALE=100,
+    # symlog maps to [0, 2.8], discounted return ≈ 6.2 in symlog → symexp gradient
+    # amplification ≈ 500×. Without scaling, raw rewards of $600+ compound to
+    # q_symlog ≈ 10 → symexp gradient 22,000× → actor grad explosion → TTFE corruption.
+    reward_scale: float = 100.0
+
+    # TTFE clip (kept as secondary safety belt alongside reward scaling)
+    lr_ttfe: float = 3e-4              # restored — reward scaling fixes root cause
+    max_grad_norm_ttfe: float = 0.5    # moderate TTFE clip (not as aggressive as 0.1)
+
+    # Run config
+    total_steps: int = 500_000
+    checkpoint_dir: str = "checkpoints/stage1_tier1_v1"
+    log_interval: int = 1_000
+
+
+@dataclass
+class Stage1Tier2aConfig(Stage1Tier1Config):
+    """Stage 1 Tier 2a: discrete N=7 categorical action space atop Tier 1 stack.
+
+    Replaces the Gumbel-Softmax mode + squashed-Gaussian magnitude head with a
+    single Categorical over 7 action levels in p.u. of P_max:
+        {-P, -2P/3, -P/3, 0, +P/3, +2P/3, +P}
+
+    Critic is rebuilt as Q(s) → (batch, N, n_atoms) with no action input, which
+    removes the `∂Q/∂a` symexp-amplification path identified as the residual
+    spike driver in Tier 1 v2.1.
+
+    All other Tier 1 choices unchanged (BroNet, HL-Gauss, reward prescale ÷100,
+    stop-gradient on actor→TTFE, fixed α=0.1, γ=0.97, τ=0.001, AdamW wd=0.1).
+    """
+    # Discrete action config
+    n_actions: int = 7
+
+    # Run config
+    checkpoint_dir: str = "checkpoints/tier2a_seed42"
+    save_every: int = 25_000     # mandatory checkpoint every 25k (eval cadence)
+    log_interval: int = 1_000
+
+
+@dataclass
+class Stage1Tier2cConfig(Stage1Tier2aConfig):
+    """Stage 1 Tier 2c: offline IQL on MILP expert trajectories (Option D path b).
+
+    Paper-standard IQL (Kostrikov et al., ICLR 2022, arXiv:2110.06169), no tuning:
+      - Expectile τ = 0.9, β_advantage = 5.0
+      - γ = 0.97, AdamW lr = 3e-4, weight_decay = 0.01
+      - Batch size 256, 200k total gradient steps
+      - Eval every 25k; mandatory process-level pause at 50k for user review
+      - Polyak τ = 0.005 on **target V only** (Q has no target)
+      - Advantage-weight clip = 100.0
+      - Reward pre-scale: symlog(r / 100)
+
+    Trajectories: preprocessed from MILP expert via `scripts/preprocess_milp_option_d.py`:
+      - train: 420,423 transitions (2020-01-01 → 2023-12-31)
+      - val:   183,871 transitions (2024-01-01 → 2025-09-30)
+      - Actions: 7-atom discrete lattice (98% mass on atoms 0, 3, 6)
+      - Dones: all False; truncateds at UTC-date boundaries (1,460 in train)
+      - Rewards ≡ MILP.rewards_env (zero mismatch by construction)
+
+    TTFE ownership: V-head owns TTFE gradient (actor + Q use detached encoding),
+    mirroring the Tier 1 / Tier 2a ownership pattern.
+    """
+    # IQL-specific hyperparameters
+    expectile_tau: float = 0.9
+    beta_advantage: float = 5.0
+    awr_weight_clip: float = 100.0
+    polyak_tau: float = 0.005
+
+    # Optimizer — unified IQL lr/wd across all four heads
+    lr: float = 3e-4
+    weight_decay: float = 0.01
+
+    # Offline run config
+    batch_size: int = 256
+    total_steps: int = 200_000
+    pause_step: int = 50_000        # non-negotiable process-level halt
+    eval_interval: int = 25_000
+    log_interval: int = 1_000
+    save_every: int = 25_000
+
+    # Trajectory paths (produced by preprocess_milp_option_d.py)
+    train_npz: str = "data/expert_trajectories/receding_horizon_train_option_d.npz"
+    val_npz:   str = "data/expert_trajectories/receding_horizon_val_option_d.npz"
+
+    checkpoint_dir: str = "checkpoints/tier2c_seed42"
+
+
+@dataclass
 class Stage2Config(TrainConfig):
     """Stage 2: Post-RTC+B co-optimization fine-tuning (stage2_v2).
 

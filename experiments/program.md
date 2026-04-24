@@ -16,6 +16,8 @@ Confirmed baselines (all measured with `experiments/prepare.py`, 2026-04-20):
 | v5.9.2 `stage1_v592/250k` | 250k | $245.37 | 1 | **+$195.37** | 45.6 / 53.7 / 0.7 | Near-valid |
 | v5.9.2 final | — | $258.74 | 55 | −$2,441 | 0.0 / 99.8 / 0.2 | Full dump |
 | v6.0 final | — | $383.11 | 64 | −$2,817 | 6.5 / 90.6 / 2.9 | Full dump |
+| **Tier 1 v1** `records/tier1_v1_peak_75k` | **75k** | **$469.77** | **7** | **+$119.77** | 42.5 / 37.5 / 20.0 | **Tier 1 RECORD** |
+| Tier 1 v2.1 (stop-grad + fresh Adam) | killed @ 75k | $90.90 | 40 | −$1,909 | 31.1 / 41.2 / 27.7 | failed adaptation (see `tier1_closeout.md`) |
 
 **Primary metric: `net_return = gross − 50 × violations`.** Gross $/day comparisons across policies with different violation counts are not meaningful — the eval harness excludes the −50 SoC penalty from `info["energy_revenue"]`, so a dump-to-floor policy that terminates early shows inflated gross revenue.
 

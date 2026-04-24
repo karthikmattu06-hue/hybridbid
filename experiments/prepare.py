@@ -26,7 +26,10 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.evaluation.evaluate_stage1 import evaluate
-from src.training.config import Stage1Config, Stage1V60Config
+from src.training.config import (
+    Stage1Config, Stage1V60Config, Stage1Tier1Config, Stage1Tier2aConfig,
+    Stage1Tier2cConfig,
+)
 
 # ── Fixed constants — never change these ──
 EVAL_SEEDS = [10, 11, 12, 13, 14]
@@ -113,10 +116,31 @@ if __name__ == "__main__":
         "--v60", action="store_true",
         help="Use Stage1V60Config (enriched 36-dim TTFE obs, obs_dim=108)",
     )
+    parser.add_argument(
+        "--tier1", action="store_true",
+        help="Use Stage1Tier1Config (BroNet critic, hidden_dim=512, HL-Gauss)",
+    )
+    parser.add_argument(
+        "--tier2a", action="store_true",
+        help="Use Stage1Tier2aConfig (discrete N=7 categorical actions atop Tier 1 stack)",
+    )
+    parser.add_argument(
+        "--tier2c", action="store_true",
+        help="Use Stage1Tier2cConfig (offline IQL on MILP expert trajectories)",
+    )
     parser.add_argument("--device", default=None, help="Override compute device")
     args = parser.parse_args()
 
-    cfg = Stage1V60Config() if args.v60 else Stage1Config()
+    if args.tier2c:
+        cfg = Stage1Tier2cConfig()
+    elif args.tier2a:
+        cfg = Stage1Tier2aConfig()
+    elif args.tier1:
+        cfg = Stage1Tier1Config()
+    elif args.v60:
+        cfg = Stage1V60Config()
+    else:
+        cfg = Stage1Config()
     if args.device:
         cfg.device = args.device
 

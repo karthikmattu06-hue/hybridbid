@@ -26,15 +26,32 @@ def symlog(x: float) -> float:
     return math.copysign(math.log1p(abs(x)), x)
 
 from src.env.ercot_env import ERCOTBatteryEnv
-from src.models.sac import SACAgent
-from src.training.config import Stage1Config, Stage1V60Config, Stage1V592Config
+from src.models.sac import SACAgent, SACAgentTier1, SACAgentTier2a
+from src.training.config import (
+    Stage1Config,
+    Stage1V60Config,
+    Stage1V592Config,
+    Stage1Tier1Config,
+    Stage1Tier2aConfig,
+)
 
 
-def train_stage1(config: Stage1Config = None, enriched_obs: bool = False):
+def train_stage1(config: Stage1Config = None, enriched_obs: bool = False,
+                 resume_from: str = None, resume_step: int = 0,
+                 reset_optimizers: bool = False):
     if config is None:
         config = Stage1Config()
 
-    if isinstance(config, Stage1V592Config):
+    # Tier 2a inherits from Tier 1, so check it FIRST for branching; only treat
+    # as generic "tier1" when the config is Stage1Tier1Config but not Tier 2a.
+    is_tier2a = isinstance(config, Stage1Tier2aConfig)
+    is_tier1 = isinstance(config, Stage1Tier1Config) and not is_tier2a
+
+    if is_tier2a:
+        version = "tier2a_discrete7"
+    elif is_tier1:
+        version = "tier1_v1"
+    elif isinstance(config, Stage1V592Config):
         version = "v5.9.2"
     elif enriched_obs:
         version = "v6.0"
@@ -44,12 +61,43 @@ def train_stage1(config: Stage1Config = None, enriched_obs: bool = False):
     print(f"Data: {config.train_start} to {config.train_end}")
     print(f"Device: {config.device}")
     print(f"Total steps: {config.total_steps}")
-    print(f"Max grad norm: actor/ttfe={config.max_grad_norm} "
-          f"critic={getattr(config, 'max_grad_norm_critic', None) or config.max_grad_norm}")
-    print(f"LR: actor={config.lr_actor} critic={config.lr_critic} ttfe={config.lr_ttfe}")
-    print(f"τ_gumbel: {config.tau_gumbel_init} → {config.tau_gumbel_final}")
-    print(f"Alpha bounds: [0.05, {getattr(config, 'alpha_max', 'inf')}]  "
-          f"idle_logit_bonus={getattr(config, 'idle_logit_bonus', 0.0)}")
+
+    if is_tier2a:
+        print("=== Stage 1 Tier 2a Configuration (discrete N=7) ===")
+        print(f"Action space: Categorical({config.n_actions}) over "
+              "{-P, -2P/3, -P/3, 0, +P/3, +2P/3, +P}")
+        print("Critic: DiscreteBroNet Q(s) -> (batch, N, n_atoms), no action input")
+        print(f"Critic optimizer: AdamW lr={config.lr_critic} weight_decay={config.weight_decay_critic}")
+        print(f"Actor optimizer: Adam lr={config.lr_actor}")
+        print(f"Gamma: {config.gamma} | Alpha: {config.alpha_fixed} (FIXED)")
+        print(f"Polyak tau: {config.tau}")
+        print(f"HL-Gauss: support=[{config.hl_gauss_min}, {config.hl_gauss_max}], "
+              f"n_atoms={config.n_atoms}, sigma={config.hl_gauss_sigma}")
+        print(f"Reward pre-scale: ÷{config.reward_scale} before symlog")
+        print(f"Gradient clip: actor={config.max_grad_norm} critic={config.max_grad_norm} "
+              f"ttfe={config.max_grad_norm_ttfe}")
+        print(f"TTFE optimizer: Adam lr={config.lr_ttfe}")
+    elif is_tier1:
+        print("=== Stage 1 Tier 1 v1 Configuration ===")
+        print("Critic: BroNet (LayerNorm + 2 residual blocks + HL-Gauss 101 bins)")
+        print(f"Critic optimizer: AdamW lr={config.lr_critic} weight_decay={config.weight_decay_critic}")
+        print(f"Actor optimizer: Adam lr={config.lr_actor} (unchanged)")
+        print(f"Gamma: {config.gamma}")
+        print(f"Alpha: {config.alpha_fixed} (FIXED, no auto-tuning)")
+        print(f"Polyak tau: {config.tau}")
+        print(f"HL-Gauss: support=[{config.hl_gauss_min}, {config.hl_gauss_max}], "
+              f"n_atoms={config.n_atoms}, sigma={config.hl_gauss_sigma}")
+        print(f"Reward pre-scale: ÷{config.reward_scale} before symlog")
+        print(f"Gradient clip: actor={config.max_grad_norm} critic={config.max_grad_norm} "
+              f"ttfe={config.max_grad_norm_ttfe}")
+        print(f"TTFE optimizer: Adam lr={config.lr_ttfe}")
+    else:
+        print(f"Max grad norm: actor/ttfe={config.max_grad_norm} "
+              f"critic={getattr(config, 'max_grad_norm_critic', None) or config.max_grad_norm}")
+        print(f"LR: actor={config.lr_actor} critic={config.lr_critic} ttfe={config.lr_ttfe}")
+        print(f"τ_gumbel: {config.tau_gumbel_init} → {config.tau_gumbel_final}")
+        print(f"Alpha bounds: [0.05, {getattr(config, 'alpha_max', 'inf')}]  "
+              f"idle_logit_bonus={getattr(config, 'idle_logit_bonus', 0.0)}")
     if enriched_obs:
         n_prices_flat = getattr(config, "n_prices_flat", config.n_prices)
         obs_dim = config.d_model + n_prices_flat + config.static_dim
@@ -73,40 +121,119 @@ def train_stage1(config: Stage1Config = None, enriched_obs: bool = False):
     )
 
     # Create SAC agent
-    agent = SACAgent(
-        stage=1,
-        device=config.device,
-        n_prices=config.n_prices,
-        n_prices_flat=getattr(config, "n_prices_flat", None),
-        d_model=config.d_model,
-        nhead=config.nhead,
-        n_layers=config.n_layers,
-        seq_len=config.seq_len,
-        static_dim=config.static_dim,
-        hidden_dim=config.hidden_dim,
-        lr_actor=config.lr_actor,
-        lr_critic=config.lr_critic,
-        lr_ttfe=config.lr_ttfe,
-        gamma=config.gamma,
-        tau=config.tau,
-        buffer_capacity=config.buffer_capacity,
-        batch_size=config.batch_size,
-        max_grad_norm=config.max_grad_norm,
-        max_grad_norm_critic=getattr(config, "max_grad_norm_critic", None),
-        alpha_max=getattr(config, "alpha_max", float("inf")),
-        idle_logit_bonus=getattr(config, "idle_logit_bonus", 0.0),
-        tau_gumbel=config.tau_gumbel_init,
-    )
+    if is_tier2a:
+        agent = SACAgentTier2a(
+            device=config.device,
+            n_prices=config.n_prices,
+            d_model=config.d_model,
+            nhead=config.nhead,
+            n_layers=config.n_layers,
+            seq_len=config.seq_len,
+            static_dim=config.static_dim,
+            hidden_dim=config.hidden_dim,
+            lr_actor=config.lr_actor,
+            lr_critic=config.lr_critic,
+            lr_ttfe=config.lr_ttfe,
+            gamma=config.gamma,
+            tau=config.tau,
+            alpha=config.alpha_fixed,
+            weight_decay=config.weight_decay_critic,
+            buffer_capacity=config.buffer_capacity,
+            batch_size=config.batch_size,
+            max_grad_norm=config.max_grad_norm,
+            max_grad_norm_ttfe=getattr(config, "max_grad_norm_ttfe", None),
+            n_actions=config.n_actions,
+            n_atoms=config.n_atoms,
+            hl_gauss_min=config.hl_gauss_min,
+            hl_gauss_max=config.hl_gauss_max,
+            hl_gauss_sigma=config.hl_gauss_sigma,
+        )
+    elif is_tier1:
+        agent = SACAgentTier1(
+            stage=1,
+            device=config.device,
+            n_prices=config.n_prices,
+            d_model=config.d_model,
+            nhead=config.nhead,
+            n_layers=config.n_layers,
+            seq_len=config.seq_len,
+            static_dim=config.static_dim,
+            hidden_dim=config.hidden_dim,
+            lr_actor=config.lr_actor,
+            lr_critic=config.lr_critic,
+            lr_ttfe=config.lr_ttfe,
+            gamma=config.gamma,
+            tau=config.tau,
+            alpha=config.alpha_fixed,
+            weight_decay=config.weight_decay_critic,
+            buffer_capacity=config.buffer_capacity,
+            batch_size=config.batch_size,
+            max_grad_norm=config.max_grad_norm,
+            max_grad_norm_ttfe=getattr(config, "max_grad_norm_ttfe", None),
+            n_atoms=config.n_atoms,
+            hl_gauss_min=config.hl_gauss_min,
+            hl_gauss_max=config.hl_gauss_max,
+            hl_gauss_sigma=config.hl_gauss_sigma,
+            tau_gumbel=config.tau_gumbel_init,
+        )
+    else:
+        agent = SACAgent(
+            stage=1,
+            device=config.device,
+            n_prices=config.n_prices,
+            n_prices_flat=getattr(config, "n_prices_flat", None),
+            d_model=config.d_model,
+            nhead=config.nhead,
+            n_layers=config.n_layers,
+            seq_len=config.seq_len,
+            static_dim=config.static_dim,
+            hidden_dim=config.hidden_dim,
+            lr_actor=config.lr_actor,
+            lr_critic=config.lr_critic,
+            lr_ttfe=config.lr_ttfe,
+            gamma=config.gamma,
+            tau=config.tau,
+            buffer_capacity=config.buffer_capacity,
+            batch_size=config.batch_size,
+            max_grad_norm=config.max_grad_norm,
+            max_grad_norm_critic=getattr(config, "max_grad_norm_critic", None),
+            alpha_max=getattr(config, "alpha_max", float("inf")),
+            idle_logit_bonus=getattr(config, "idle_logit_bonus", 0.0),
+            tau_gumbel=config.tau_gumbel_init,
+        )
 
     # Gumbel temperature annealing schedule
     tau_gumbel_range = config.tau_gumbel_init - config.tau_gumbel_final
+
+    # Resume from checkpoint (network + optimizer state; replay buffer starts empty)
+    if resume_from is not None:
+        print(f"Resuming from checkpoint: {resume_from} at step {resume_step}")
+        if reset_optimizers:
+            print("  reset_optimizers=True — loading weights only; Adam moments reset to zero")
+        agent.load_checkpoint(resume_from, reset_optimizers=reset_optimizers)
+        if not is_tier2a:
+            # tau_gumbel is restored from checkpoint; override with scheduled value
+            # in case checkpoint predates the current schedule.
+            frac_resume = min(1.0, resume_step / max(config.total_steps, 1))
+            agent.tau_gumbel = config.tau_gumbel_init - frac_resume * tau_gumbel_range
+            print(f"  tau_gumbel set to {agent.tau_gumbel:.4f} (step {resume_step})")
+
+        # Confirm Adam state is fresh if reset was requested
+        if reset_optimizers:
+            def _n_state_entries(optim):
+                return sum(len(v) for v in optim.state_dict()["state"].values())
+            ttfe_n = _n_state_entries(agent.ttfe_optimizer)
+            actor_n = _n_state_entries(agent.actor_optimizer)
+            critic_n = _n_state_entries(agent.critic_optimizer)
+            print(f"  Adam state entries per param group (should be 0 pre-first-step): "
+                  f"ttfe={ttfe_n} actor={actor_n} critic={critic_n}")
 
     # Training loop
     obs, _ = env.reset()
     episode_reward = 0.0      # symlog-transformed (what the agent trains on)
     episode_raw_reward = 0.0  # pre-symlog (for comparison with v5.7/v5.8)
     episode_count = 0
-    step = 0
+    step = resume_step
     log_interval = config.log_interval
     save_interval = config.save_every
     t_start = time.time()
@@ -131,17 +258,32 @@ def train_stage1(config: Stage1Config = None, enriched_obs: bool = False):
 
     while step < config.total_steps:
         # Select action
-        action = agent.select_action(obs)
+        if is_tier2a:
+            env_action, action_idx = agent.select_action(obs)
+            action = env_action                      # 4D, for env.step
+            buffer_action = np.array([action_idx], dtype=np.float32)  # for buffer
+        else:
+            action = agent.select_action(obs)
+            buffer_action = action
 
         # Step environment
         next_obs, reward, terminated, truncated, info = env.step(action)
 
-        # Apply symlog to economic reward component; keep SoC penalty at original scale.
-        # symlog compresses ERCOT's heavy-tailed price distribution (Cauchy residuals,
-        # Uri storm $9k/MWh) without destroying reward ordering. DreamerV3 (Hafner 2023).
-        soc_penalty = -50.0 if info["soc_violated"] else 0.0
+        # Apply symlog to economic reward component.
         raw_econ = info["energy_revenue"] + info["timing_bonus"]
-        transformed_reward = symlog(raw_econ) + soc_penalty
+        if is_tier1 or is_tier2a:
+            # Pre-scale before symlog: ERCOT rewards of $0–1500/step compress to
+            # $0–15, so symlog ≈ [0, 2.8], discounted return stays in HL-Gauss
+            # support. Without scaling: q_symlog≈10 → symexp grad ≈ 22k → actor
+            # grad explosion → TTFE corruption (observed: grad_a=1274 at step 6k).
+            # SoC penalty scaled proportionally: -50/100 = -0.5 → symlog(-0.5) ≈ -0.41
+            reward_scale = config.reward_scale
+            scaled_econ = raw_econ / reward_scale
+            soc_penalty_raw = -50.0 / reward_scale if info["soc_violated"] else 0.0
+            transformed_reward = symlog(scaled_econ) + symlog(soc_penalty_raw)
+        else:
+            soc_penalty = -50.0 if info["soc_violated"] else 0.0
+            transformed_reward = symlog(raw_econ) + soc_penalty
 
         episode_reward += transformed_reward
         episode_raw_reward += reward  # original env reward (pre-symlog) for logging
@@ -159,20 +301,24 @@ def train_stage1(config: Stage1Config = None, enriched_obs: bool = False):
                 recent_da_rt_basis.append(float(sf[29]))     # da_rt_basis
 
         # Store symlog-transformed reward in replay buffer
-        agent.buffer.add(obs, action, transformed_reward, next_obs, terminated)
+        agent.buffer.add(obs, buffer_action, transformed_reward, next_obs, terminated)
 
-        # Anneal Gumbel temperature
-        frac = min(1.0, step / max(config.total_steps, 1))
-        agent.tau_gumbel = config.tau_gumbel_init - frac * tau_gumbel_range
+        # Anneal Gumbel temperature (not used for Tier 2a — no Gumbel path)
+        if not is_tier2a:
+            frac = min(1.0, step / max(config.total_steps, 1))
+            agent.tau_gumbel = config.tau_gumbel_init - frac * tau_gumbel_range
 
         # Update agent
         metrics = {}
         if step >= config.warmup_steps:
-            # Snapshot state every 100 steps for NaN recovery
-            if step % 100 == 0:
-                prev_snapshot = agent.snapshot_state()
-
-            metrics = agent.update(tau_gumbel=agent.tau_gumbel)
+            if is_tier2a:
+                metrics = agent.update()
+            else:
+                # Snapshot state every 100 steps for NaN recovery (non-Tier2a only;
+                # Tier 2a relies on in-update NaN detection alone).
+                if step % 100 == 0:
+                    prev_snapshot = agent.snapshot_state()
+                metrics = agent.update(tau_gumbel=agent.tau_gumbel)
 
             # NaN guard: check if update() detected NaN in parameters
             if metrics.get("nan_detected"):
@@ -189,7 +335,9 @@ def train_stage1(config: Stage1Config = None, enriched_obs: bool = False):
                     agent.save_emergency_checkpoint(emergency_path, prev_snapshot)
                     print(f"  Emergency checkpoint (last good state) saved: {emergency_path}")
                 else:
-                    print("  No previous snapshot available for emergency save.")
+                    ckpt_path = os.path.join(config.checkpoint_dir, f"nan_at_step{step}.pt")
+                    agent.save_checkpoint(ckpt_path)
+                    print(f"  NaN checkpoint (post-corruption) saved: {ckpt_path}")
                 return agent, recent_rewards
 
         obs = next_obs
@@ -221,7 +369,7 @@ def train_stage1(config: Stage1Config = None, enriched_obs: bool = False):
                 mode_pct_charge = mode_pct_discharge = mode_pct_idle = 0.0
             mode_counts = {0: 0, 1: 0, 2: 0}  # reset window
 
-            gumbel_temperature = agent.tau_gumbel
+            gumbel_temperature = getattr(agent, "tau_gumbel", 0.0)  # 0 for Tier 2a (no Gumbel)
 
             # Check for NaN in metrics values (belt-and-suspenders with param check)
             has_nan = any(
@@ -243,29 +391,105 @@ def train_stage1(config: Stage1Config = None, enriched_obs: bool = False):
             b_dc = metrics.get('mode_probs_dc', 0) * 100
             b_id = metrics.get('mode_probs_id', 0) * 100
 
-            print(
-                f"Step {step:>7d}/{config.total_steps} | "
-                f"ep={episode_count} | "
-                f"critic={metrics.get('critic_loss', 0):.4f} | "
-                f"actor={metrics.get('actor_loss', 0):.4f} | "
-                f"alpha={metrics.get('alpha', 0):.4f} | "
-                f"avg_reward={avg_reward:.1f} | "
-                f"avg_raw_reward={avg_raw_reward:.1f} | "
-                f"avg_soc={avg_soc:.2f} | "
-                f"grad_c={metrics.get('grad_c_pre_clip', metrics.get('critic_grad_norm', 0)):.3f}"
-                f"→{metrics.get('grad_c_post_clip', metrics.get('critic_grad_norm', 0)):.3f} "
-                f"[q1={metrics.get('grad_q1', 0):.1f} q2={metrics.get('grad_q2', 0):.1f}] | "
-                f"grad_a={metrics.get('grad_a_pre_clip', metrics.get('actor_grad_norm', 0)):.3f}"
-                f"→{metrics.get('grad_a_post_clip', metrics.get('actor_grad_norm', 0)):.3f} | "
-                f"grad_t={metrics.get('ttfe_grad_norm', 0):.3f} "
-                f"[proj={metrics.get('grad_ttfe_proj', 0):.1f} attn={metrics.get('grad_ttfe_attn', 0):.1f}] | "
-                f"q_mean={metrics.get('q_mean', 0):.2f} q_maxabs={metrics.get('q_max_abs', 0):.1f} | "
-                f"mode_env=[ch={mode_pct_charge:.0f}% dc={mode_pct_discharge:.0f}% id={mode_pct_idle:.0f}%] "
-                f"mode_batch=[ch={b_ch:.0f}% dc={b_dc:.0f}% id={b_id:.0f}%] | "
-                f"tau_g={gumbel_temperature:.3f} | "
-                f"{steps_per_sec:.1f} steps/s{feat_str}{nan_flag}",
-                flush=True,
-            )
+            if is_tier2a:
+                # Tier 2a: HL-Gauss + policy entropy + per-action distribution
+                action_dist = " ".join(
+                    f"p{i}={metrics.get(f'action_p{i}', 0):.2f}" for i in range(config.n_actions)
+                )
+                t2a_str = (
+                    f" | bin_ent={metrics.get('critic_bin_entropy', 0):.3f}"
+                    f" bin_argmax={metrics.get('critic_bin_argmax_support_value', 0):.2f}"
+                    f" q_exp_mean={metrics.get('q_expected_mean', 0):.2f}"
+                    f" q_exp_maxabs={metrics.get('q_expected_max_abs', 0):.1f}"
+                    f" | pi_H={metrics.get('policy_entropy', 0):.3f}"
+                    f" | {action_dist}"
+                )
+                if metrics.get("grad_a_pre_clip", 0) > 50.0:
+                    t2a_str += (
+                        f" | SPIKE batch_price_max=${metrics.get('batch_price_max', 0):.0f}"
+                        f" n>2k={metrics.get('batch_price_n_gt_2k', 0)}"
+                        f" n>5k={metrics.get('batch_price_n_gt_5k', 0)}"
+                    )
+                print(
+                    f"Step {step:>7d}/{config.total_steps} | "
+                    f"ep={episode_count} | "
+                    f"critic={metrics.get('critic_loss', 0):.4f} | "
+                    f"actor={metrics.get('actor_loss', 0):.4f} | "
+                    f"avg_reward={avg_reward:.1f} | "
+                    f"avg_raw_reward={avg_raw_reward:.1f} | "
+                    f"avg_soc={avg_soc:.2f} | "
+                    f"grad_c={metrics.get('grad_c_pre_clip', 0):.3f}"
+                    f"→{metrics.get('grad_c_post_clip', 0):.3f} | "
+                    f"grad_a={metrics.get('grad_a_pre_clip', 0):.3f}"
+                    f"→{metrics.get('grad_a_post_clip', 0):.3f} | "
+                    f"grad_t={metrics.get('ttfe_grad_norm', 0):.3f} "
+                    f"[proj={metrics.get('grad_ttfe_proj', 0):.1f} attn={metrics.get('grad_ttfe_attn', 0):.1f}] | "
+                    f"mode_env=[ch={mode_pct_charge:.0f}% dc={mode_pct_discharge:.0f}% id={mode_pct_idle:.0f}%] "
+                    f"mode_batch=[ch={b_ch:.0f}% dc={b_dc:.0f}% id={b_id:.0f}%] | "
+                    f"{steps_per_sec:.1f} steps/s{t2a_str}{nan_flag}",
+                    flush=True,
+                )
+            elif is_tier1:
+                # Tier 1: no alpha logging; add HL-Gauss diagnostics
+                tier1_str = (
+                    f" | bin_ent={metrics.get('critic_bin_entropy', 0):.3f}"
+                    f" bin_argmax={metrics.get('critic_bin_argmax_support_value', 0):.2f}"
+                    f" q_exp_mean={metrics.get('q_expected_mean', 0):.2f}"
+                    f" q_exp_maxabs={metrics.get('q_expected_max_abs', 0):.1f}"
+                )
+                # Spike-gated ERCOT price diagnostic (v2.1): only log batch price
+                # distribution when grad_a_pre > 50 — characterizes secondary
+                # amplification path without polluting normal logs.
+                if metrics.get("grad_a_pre_clip", 0) > 50.0:
+                    tier1_str += (
+                        f" | SPIKE batch_price_max=${metrics.get('batch_price_max', 0):.0f}"
+                        f" n>2k={metrics.get('batch_price_n_gt_2k', 0)}"
+                        f" n>5k={metrics.get('batch_price_n_gt_5k', 0)}"
+                    )
+                print(
+                    f"Step {step:>7d}/{config.total_steps} | "
+                    f"ep={episode_count} | "
+                    f"critic={metrics.get('critic_loss', 0):.4f} | "
+                    f"actor={metrics.get('actor_loss', 0):.4f} | "
+                    f"avg_reward={avg_reward:.1f} | "
+                    f"avg_raw_reward={avg_raw_reward:.1f} | "
+                    f"avg_soc={avg_soc:.2f} | "
+                    f"grad_c={metrics.get('grad_c_pre_clip', 0):.3f}"
+                    f"→{metrics.get('grad_c_post_clip', 0):.3f} | "
+                    f"grad_a={metrics.get('grad_a_pre_clip', 0):.3f}"
+                    f"→{metrics.get('grad_a_post_clip', 0):.3f} | "
+                    f"grad_t={metrics.get('ttfe_grad_norm', 0):.3f} "
+                    f"[proj={metrics.get('grad_ttfe_proj', 0):.1f} attn={metrics.get('grad_ttfe_attn', 0):.1f}] | "
+                    f"mode_env=[ch={mode_pct_charge:.0f}% dc={mode_pct_discharge:.0f}% id={mode_pct_idle:.0f}%] "
+                    f"mode_batch=[ch={b_ch:.0f}% dc={b_dc:.0f}% id={b_id:.0f}%] | "
+                    f"tau_g={gumbel_temperature:.3f} | "
+                    f"{steps_per_sec:.1f} steps/s{tier1_str}{nan_flag}",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"Step {step:>7d}/{config.total_steps} | "
+                    f"ep={episode_count} | "
+                    f"critic={metrics.get('critic_loss', 0):.4f} | "
+                    f"actor={metrics.get('actor_loss', 0):.4f} | "
+                    f"alpha={metrics.get('alpha', 0):.4f} | "
+                    f"avg_reward={avg_reward:.1f} | "
+                    f"avg_raw_reward={avg_raw_reward:.1f} | "
+                    f"avg_soc={avg_soc:.2f} | "
+                    f"grad_c={metrics.get('grad_c_pre_clip', metrics.get('critic_grad_norm', 0)):.3f}"
+                    f"→{metrics.get('grad_c_post_clip', metrics.get('critic_grad_norm', 0)):.3f} "
+                    f"[q1={metrics.get('grad_q1', 0):.1f} q2={metrics.get('grad_q2', 0):.1f}] | "
+                    f"grad_a={metrics.get('grad_a_pre_clip', metrics.get('actor_grad_norm', 0)):.3f}"
+                    f"→{metrics.get('grad_a_post_clip', metrics.get('actor_grad_norm', 0)):.3f} | "
+                    f"grad_t={metrics.get('ttfe_grad_norm', 0):.3f} "
+                    f"[proj={metrics.get('grad_ttfe_proj', 0):.1f} attn={metrics.get('grad_ttfe_attn', 0):.1f}] | "
+                    f"q_mean={metrics.get('q_mean', 0):.2f} q_maxabs={metrics.get('q_max_abs', 0):.1f} | "
+                    f"mode_env=[ch={mode_pct_charge:.0f}% dc={mode_pct_discharge:.0f}% id={mode_pct_idle:.0f}%] "
+                    f"mode_batch=[ch={b_ch:.0f}% dc={b_dc:.0f}% id={b_id:.0f}%] | "
+                    f"tau_g={gumbel_temperature:.3f} | "
+                    f"{steps_per_sec:.1f} steps/s{feat_str}{nan_flag}",
+                    flush=True,
+                )
 
             if has_nan:
                 print("FATAL: NaN detected in metrics. Saving emergency checkpoint and stopping.")
@@ -275,6 +499,12 @@ def train_stage1(config: Stage1Config = None, enriched_obs: bool = False):
                     )
                     agent.save_emergency_checkpoint(emergency_path, prev_snapshot)
                     print(f"  Emergency checkpoint saved: {emergency_path}")
+                else:
+                    ckpt_path = os.path.join(
+                        config.checkpoint_dir, f"nan_metrics_step{step}.pt"
+                    )
+                    agent.save_checkpoint(ckpt_path)
+                    print(f"  NaN checkpoint saved: {ckpt_path}")
                 return agent, []
 
             # Clear old history to avoid memory growth
@@ -324,9 +554,44 @@ if __name__ == "__main__":
         help="Stage 1 v5.9.2: stability fixes (lr_critic=1e-4, critic_clip=0.5, "
              "alpha_max=0.5, idle_logit_bonus=0.1). 500k validation run."
     )
+    parser.add_argument(
+        "--tier1", action="store_true",
+        help="Stage 1 Tier 1 v1: BroNet critic + HL-Gauss loss + fixed alpha=0.1 "
+             "+ gamma=0.97 + tau=0.001 + AdamW. 500k validation run."
+    )
+    parser.add_argument(
+        "--tier2a", action="store_true",
+        help="Stage 1 Tier 2a: discrete N=7 categorical action space atop Tier 1 "
+             "stack. Replaces Gumbel+continuous with Categorical(7) over "
+             "{-P, -2P/3, -P/3, 0, +P/3, +2P/3, +P}. 500k from-scratch run."
+    )
+    parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility")
+    parser.add_argument("--checkpoint-dir", type=str, default=None, help="Override checkpoint directory")
+    parser.add_argument("--resume", type=str, default=None,
+                        help="Resume from checkpoint path (e.g., checkpoints/x/checkpoint_step50000.pt)")
+    parser.add_argument("--resume-step", type=int, default=0,
+                        help="Step counter to resume at; drives tau_gumbel anneal and save intervals")
+    parser.add_argument("--reset-optimizers", action="store_true",
+                        help="Resume model weights only; reset Adam optimizer moments to zero. "
+                             "Use after a gradient-topology change to purge stale momentum.")
     args = parser.parse_args()
 
-    if args.v592:
+    # Set seed before anything else
+    if args.seed is not None:
+        import torch
+        import random
+        import numpy as np
+        torch.manual_seed(args.seed)
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(args.seed)
+
+    if args.tier2a:
+        config = Stage1Tier2aConfig()
+    elif args.tier1:
+        config = Stage1Tier1Config()
+    elif args.v592:
         config = Stage1V592Config()
     elif args.v60:
         config = Stage1V60Config()
@@ -342,5 +607,9 @@ if __name__ == "__main__":
         config.device = args.device
     if args.log_interval is not None:
         config.log_interval = args.log_interval
+    if args.checkpoint_dir is not None:
+        config.checkpoint_dir = args.checkpoint_dir
 
-    train_stage1(config, enriched_obs=args.v60)
+    train_stage1(config, enriched_obs=args.v60,
+                 resume_from=args.resume, resume_step=args.resume_step,
+                 reset_optimizers=args.reset_optimizers)

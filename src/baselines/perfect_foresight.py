@@ -63,6 +63,7 @@ def solve_energy_only_mip(
     soc_initial: float = None,
     solver: str = None,
     verbose: bool = False,
+    time_limit: float = None,
 ) -> dict:
     """
     Solve energy-only perfect foresight MIP for a time horizon.
@@ -141,9 +142,23 @@ def solve_energy_only_mip(
     # ── Solve ──
     problem = cp.Problem(objective, constraints)
 
+    # Per-solver time-limit plumbing. CVXPY passes unrecognized kwargs straight
+    # to the backend; param names differ by solver.
+    solver_opts = {}
+    if time_limit is not None:
+        if solver == "GUROBI":
+            solver_opts["TimeLimit"] = float(time_limit)
+        elif solver == "HIGHS":
+            solver_opts["time_limit"] = float(time_limit)
+        elif solver == "CPLEX":
+            solver_opts["timelimit"] = float(time_limit)
+        elif solver == "SCIP":
+            solver_opts["limits/time"] = float(time_limit)
+        # GLPK_MI has no uniform time-limit kwarg — skip silently.
+
     t_start = time.time()
     try:
-        problem.solve(solver=solver, verbose=verbose)
+        problem.solve(solver=solver, verbose=verbose, **solver_opts)
     except cp.error.SolverError as e:
         logger.error(f"Solver error: {e}")
         return {
@@ -153,12 +168,26 @@ def solve_energy_only_mip(
         }
     solve_time = time.time() - t_start
 
+    # Accept time-limit-with-feasible-solution as usable. CVXPY canonicalises
+    # GUROBI's TIME_LIMIT to "user_limit"; values may still be populated if a
+    # feasible incumbent was found.
+    has_feasible = (
+        p_ch.value is not None
+        and p_dch.value is not None
+        and soc.value is not None
+    )
     if problem.status not in ["optimal", "optimal_inaccurate"]:
-        logger.warning(f"MIP solve status: {problem.status}")
-        return {
-            "status": problem.status,
-            "solve_time": solve_time,
-        }
+        if problem.status in ("user_limit", "user_limit_inaccurate") and has_feasible:
+            logger.warning(
+                f"MIP hit time limit ({time_limit}s) with feasible incumbent — "
+                f"accepting suboptimal solution"
+            )
+        else:
+            logger.warning(f"MIP solve status: {problem.status}")
+            return {
+                "status": problem.status,
+                "solve_time": solve_time,
+            }
 
     # ── Extract results ──
     p_ch_val = np.array(p_ch.value).flatten()

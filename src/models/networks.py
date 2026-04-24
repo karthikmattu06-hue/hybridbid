@@ -6,8 +6,14 @@ Actor: Hybrid discrete-continuous policy.
   - Continuous magnitude via squashed Gaussian
   Matches Li et al. (2024) Eq. 1, 23.
 
-Critic: Twin Q-networks for clipped double-Q learning.
+Critic (standard): Twin Q-networks for clipped double-Q learning.
+
+Critic (Tier 1): BroNetCritic — LayerNorm + residual blocks + HL-Gauss categorical head.
+  Reference: Farebrother et al., "Stop Regressing: Training Value Functions via
+  Classification for Scalable Deep RL", ICML 2024 (arXiv:2403.03950).
 """
+
+import math
 
 import numpy as np
 import torch
@@ -258,3 +264,334 @@ class TwinCritic(nn.Module):
     def forward(self, obs: torch.Tensor, action: torch.Tensor):
         """Returns (Q1, Q2) both as (batch, 1)."""
         return self.q1(obs, action), self.q2(obs, action)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tier 1 critic: BroNet + HL-Gauss categorical head
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class HLGaussLoss:
+    """
+    HL-Gauss: convert scalar regression targets to soft categorical distributions
+    over a fixed support, then use cross-entropy as the critic loss.
+
+    Reference: Farebrother et al., "Stop Regressing: Training Value Functions via
+    Classification for Scalable Deep RL", ICML 2024 (arXiv:2403.03950).
+
+    The support spans [-20, 20] in symlog space.  Since rewards are symlog-
+    transformed before entering the buffer, symlog(return) is bounded: a reward
+    of ±50 symlogs to ±3.9, and even the τ=0.97 infinite-horizon sum is ≤ symlog
+    of the raw sum, which stays well inside ±20 for ERCOT arbitrage.
+
+    Parameters
+    ----------
+    min_value, max_value : float
+        Left and right edges of the support (symlog scale).  Default: [-20, 20].
+    n_atoms : int
+        Number of support atoms.  Default: 101.
+    sigma : float
+        Gaussian smoothing bandwidth (bins).  Default: 0.75.
+    """
+
+    def __init__(
+        self,
+        min_value: float = -20.0,
+        max_value: float = 20.0,
+        n_atoms: int = 101,
+        sigma: float = 0.75,
+    ):
+        self.min_value = min_value
+        self.max_value = max_value
+        self.n_atoms = n_atoms
+        self.sigma = sigma
+        self.support = torch.linspace(min_value, max_value, n_atoms)
+        # Midpoints between consecutive atoms, used as bin boundaries.
+        self._midpoints = 0.5 * (self.support[:-1] + self.support[1:])  # (n_atoms-1,)
+
+    def to(self, device: str) -> "HLGaussLoss":
+        self.support = self.support.to(device)
+        self._midpoints = self._midpoints.to(device)
+        return self
+
+    def transform_to_probs(self, target: torch.Tensor) -> torch.Tensor:
+        """
+        Convert scalar targets to HL-Gauss soft categorical distributions.
+
+        Uses midpoints between adjacent support atoms as bin boundaries.
+        The leftmost bin absorbs mass from -inf; the rightmost from +inf.
+
+        Parameters
+        ----------
+        target : (batch,) float tensor — values in symlog space.
+
+        Returns
+        -------
+        probs : (batch, n_atoms) — non-negative, sums to 1 along dim=-1.
+        """
+        # CDF of N(target, sigma) evaluated at each midpoint: (batch, n_atoms-1)
+        cdf_at_mid = 0.5 * (
+            1.0 + torch.erf(
+                (self._midpoints.unsqueeze(0) - target.unsqueeze(-1))
+                / (math.sqrt(2.0) * self.sigma)
+            )
+        )
+        # Prepend 0 and append 1 to capture boundary mass.
+        zeros = torch.zeros(target.shape[0], 1, device=target.device)
+        ones = torch.ones(target.shape[0], 1, device=target.device)
+        cdf_full = torch.cat([zeros, cdf_at_mid, ones], dim=-1)  # (batch, n_atoms+1)
+        probs = cdf_full[:, 1:] - cdf_full[:, :-1]              # (batch, n_atoms)
+        return probs
+
+    def transform_from_probs(self, probs: torch.Tensor) -> torch.Tensor:
+        """Scalar expectation of the categorical distribution (symlog scale)."""
+        return (probs * self.support.to(probs.device)).sum(dim=-1, keepdim=True)  # (batch, 1)
+
+    def compute_q(self, logits: torch.Tensor):
+        """
+        Convert critic logits to (q_raw, q_symlog).
+
+        q_symlog : expectation over support (symlog scale).
+        q_raw    : symexp(q_symlog) — natural scale, used in actor loss.
+        """
+        probs = F.softmax(logits, dim=-1)
+        q_symlog = self.transform_from_probs(probs)                           # (batch, 1)
+        q_raw = torch.sign(q_symlog) * (torch.exp(torch.abs(q_symlog)) - 1)  # symexp
+        return q_raw, q_symlog
+
+    def loss(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """
+        Cross-entropy loss between predicted logits and HL-Gauss target distribution.
+
+        Parameters
+        ----------
+        logits : (batch, n_atoms)
+        target : (batch,) — scalar values in symlog space.
+
+        Returns
+        -------
+        loss : (batch,) — per-sample cross-entropy.
+        """
+        target_probs = self.transform_to_probs(target)        # (batch, n_atoms)
+        log_pred = F.log_softmax(logits, dim=-1)
+        return -(target_probs * log_pred).sum(dim=-1)         # (batch,)
+
+
+class BroNetCritic(nn.Module):
+    """
+    BroNet-style critic: Entry block + 2 pre-LN residual blocks + HL-Gauss head.
+
+    Returns logits (n_atoms) over the HL-Gauss support — NOT a scalar.
+    Use HLGaussLoss.compute_q() to convert logits to scalar Q estimates.
+
+    Reference architecture from Björck et al. "Is Deep Learning Good for
+    Reinforcement Learning?" (BroNet / LayerNorm critic family).
+    """
+
+    def __init__(
+        self,
+        obs_dim: int = 90,
+        act_dim: int = 4,
+        hidden: int = 512,
+        n_atoms: int = 101,
+    ):
+        super().__init__()
+        self.entry = nn.Sequential(
+            nn.Linear(obs_dim + act_dim, hidden),
+            nn.LayerNorm(hidden),
+            nn.ReLU(),
+        )
+        self.block1 = self._make_block(hidden)
+        self.block2 = self._make_block(hidden)
+        self.head = nn.Linear(hidden, n_atoms)
+        self.n_atoms = n_atoms
+
+    @staticmethod
+    def _make_block(hidden: int) -> nn.Sequential:
+        return nn.Sequential(
+            nn.LayerNorm(hidden),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden),
+        )
+
+    def forward(self, obs: torch.Tensor, act: torch.Tensor) -> torch.Tensor:
+        """Returns logits of shape (batch, n_atoms)."""
+        x = torch.cat([obs, act], dim=-1)
+        h = self.entry(x)
+        h = h + self.block1(h)
+        h = h + self.block2(h)
+        return self.head(h)
+
+
+class TwinBroNetCritic(nn.Module):
+    """Twin BroNet critics for clipped double-Q learning (Tier 1)."""
+
+    def __init__(
+        self,
+        obs_dim: int = 90,
+        action_dim: int = 4,
+        hidden: int = 512,
+        n_atoms: int = 101,
+    ):
+        super().__init__()
+        self.q1 = BroNetCritic(obs_dim, action_dim, hidden, n_atoms)
+        self.q2 = BroNetCritic(obs_dim, action_dim, hidden, n_atoms)
+
+    def forward(self, obs: torch.Tensor, action: torch.Tensor):
+        """Returns (logits_q1, logits_q2), each (batch, n_atoms)."""
+        return self.q1(obs, action), self.q2(obs, action)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tier 2a: Discrete N=7 actor + BroNet/HL-Gauss Q(s)→[N, n_atoms] critic
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Discrete action grid (Tier 2a): 7 levels in p.u. of P_max.
+# Negative = charge, positive = discharge, 0 = idle.
+TIER2A_ACTION_LEVELS = [-1.0, -2.0 / 3.0, -1.0 / 3.0, 0.0, 1.0 / 3.0, 2.0 / 3.0, 1.0]
+TIER2A_N_ACTIONS = 7
+
+
+def tier2a_idx_to_env_action(idx: int) -> np.ndarray:
+    """
+    Map a discrete action index (0..6) to the 4D env action format
+    `[mode_onehot(3), energy_mag(1)]` expected by ercot_env.py.
+
+    Idx → level mapping:
+      0: -P_max   → charge,    mag=1.0
+      1: -2P/3    → charge,    mag=2/3
+      2: -P/3     → charge,    mag=1/3
+      3:  0       → idle,      mag=0.0
+      4: +P/3     → discharge, mag=1/3
+      5: +2P/3    → discharge, mag=2/3
+      6: +P_max   → discharge, mag=1.0
+    """
+    level = TIER2A_ACTION_LEVELS[idx]
+    mode_onehot = np.zeros(3, dtype=np.float32)
+    if level < 0:
+        mode_onehot[MODE_CHARGE] = 1.0
+    elif level > 0:
+        mode_onehot[MODE_DISCHARGE] = 1.0
+    else:
+        mode_onehot[MODE_IDLE] = 1.0
+    mag = abs(level)
+    return np.concatenate([mode_onehot, [mag]]).astype(np.float32)
+
+
+# Pre-materialize the (7, 4) translation table for fast batched sim lookups.
+TIER2A_IDX_TO_ENV_ACTION = np.stack(
+    [tier2a_idx_to_env_action(i) for i in range(TIER2A_N_ACTIONS)]
+).astype(np.float32)
+
+
+class ActorDiscrete7(nn.Module):
+    """
+    Discrete SAC actor: Categorical over 7 action levels.
+
+    No Gumbel-Softmax, no continuous magnitude, no reparameterization. Outputs
+    raw logits; the SAC update consumes the full softmax distribution to form
+    closed-form expectations over the action space.
+
+    Input : obs (batch, obs_dim)
+    Output: logits (batch, 7)
+    """
+
+    def __init__(self, obs_dim: int = 90, hidden_dim: int = 512,
+                 n_actions: int = TIER2A_N_ACTIONS):
+        super().__init__()
+        self.obs_dim = obs_dim
+        self.n_actions = n_actions
+        self.fc1 = nn.Linear(obs_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.logit_head = nn.Linear(hidden_dim, n_actions)
+
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        h = F.relu(self.fc1(obs))
+        h = F.relu(self.fc2(h))
+        return self.logit_head(h)
+
+    def sample(self, obs: torch.Tensor, deterministic: bool = False):
+        """
+        Returns
+        -------
+        action_idx    : (batch,) long — sampled (or argmax) action index.
+        log_probs_all : (batch, n_actions) — full distribution log-probs.
+        probs_all     : (batch, n_actions) — full softmax.
+        """
+        logits = self.forward(obs)
+        log_probs_all = F.log_softmax(logits, dim=-1)
+        probs_all = log_probs_all.exp()
+        if deterministic:
+            action_idx = logits.argmax(dim=-1)
+        else:
+            action_idx = torch.distributions.Categorical(probs=probs_all).sample()
+        return action_idx, log_probs_all, probs_all
+
+
+class DiscreteBroNetCritic(nn.Module):
+    """
+    BroNet-style critic for Tier 2a: Q(s) → logits of shape (batch, N, n_atoms).
+
+    Entry block + 2 pre-LN residual blocks + head that emits N * n_atoms logits,
+    reshaped to (batch, N, n_atoms). Each slice along dim=1 is an independent
+    HL-Gauss distribution over the same symlog support.
+
+    Input: obs only — no action. This removes the `∂Q/∂a` symexp-amplification
+    path that was the surviving spike driver in Tier 1 v2.1.
+    """
+
+    def __init__(
+        self,
+        obs_dim: int = 90,
+        n_actions: int = TIER2A_N_ACTIONS,
+        hidden: int = 512,
+        n_atoms: int = 101,
+    ):
+        super().__init__()
+        self.n_actions = n_actions
+        self.n_atoms = n_atoms
+        self.entry = nn.Sequential(
+            nn.Linear(obs_dim, hidden),
+            nn.LayerNorm(hidden),
+            nn.ReLU(),
+        )
+        self.block1 = self._make_block(hidden)
+        self.block2 = self._make_block(hidden)
+        self.head = nn.Linear(hidden, n_actions * n_atoms)
+
+    @staticmethod
+    def _make_block(hidden: int) -> nn.Sequential:
+        return nn.Sequential(
+            nn.LayerNorm(hidden),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden),
+        )
+
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        """Returns logits of shape (batch, n_actions, n_atoms)."""
+        h = self.entry(obs)
+        h = h + self.block1(h)
+        h = h + self.block2(h)
+        flat = self.head(h)                                        # (batch, N*A)
+        return flat.view(-1, self.n_actions, self.n_atoms)
+
+
+class TwinDiscreteBroNetCritic(nn.Module):
+    """Twin discrete BroNet critics for clipped double-Q (Tier 2a)."""
+
+    def __init__(
+        self,
+        obs_dim: int = 90,
+        n_actions: int = TIER2A_N_ACTIONS,
+        hidden: int = 512,
+        n_atoms: int = 101,
+    ):
+        super().__init__()
+        self.q1 = DiscreteBroNetCritic(obs_dim, n_actions, hidden, n_atoms)
+        self.q2 = DiscreteBroNetCritic(obs_dim, n_actions, hidden, n_atoms)
+
+    def forward(self, obs: torch.Tensor):
+        """Returns (logits_q1, logits_q2), each (batch, n_actions, n_atoms)."""
+        return self.q1(obs), self.q2(obs)
