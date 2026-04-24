@@ -22,9 +22,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
 from src.env.ercot_env import ERCOTBatteryEnv
 from src.models.sac import SACAgent, SACAgentTier1, SACAgentTier2a
+from src.models.networks import TIER2A_IDX_TO_ENV_ACTION
 from src.training.config import (
     Stage1Config, Stage1V60Config, Stage1Tier1Config, Stage1Tier2aConfig,
+    Stage1Tier2cConfig,
 )
+from src.agents.iql import IQLAgent, IQLConfig
 
 # Baselines from CLAUDE.md (pre-RTC+B, $/day for 10 MW / 20 MWh battery)
 TBEX_DAILY = 870.0
@@ -40,8 +43,9 @@ def evaluate(checkpoint_path: str, config: Stage1Config = None, verbose: bool = 
         config = Stage1Config()
 
     enriched = isinstance(config, Stage1V60Config)
-    tier2a = isinstance(config, Stage1Tier2aConfig)
-    tier1 = isinstance(config, Stage1Tier1Config) and not tier2a
+    tier2c = isinstance(config, Stage1Tier2cConfig)
+    tier2a = isinstance(config, Stage1Tier2aConfig) and not tier2c
+    tier1 = isinstance(config, Stage1Tier1Config) and not tier2a and not tier2c
 
     # --- Environment (test set, deterministic) ---
     battery_config = dict(
@@ -62,7 +66,35 @@ def evaluate(checkpoint_path: str, config: Stage1Config = None, verbose: bool = 
     n_days = len(env.day_starts)
 
     # --- Agent ---
-    if tier2a:
+    if tier2c:
+        iql_cfg = IQLConfig(
+            obs_dim=config.d_model + getattr(config, "n_prices_flat", config.n_prices) + config.static_dim,
+            hidden_dim=config.hidden_dim,
+            n_actions=config.n_actions,
+            n_prices=config.n_prices,
+            n_prices_flat=getattr(config, "n_prices_flat", config.n_prices),
+            seq_len=config.seq_len,
+            static_dim=config.static_dim,
+            d_model=config.d_model,
+            nhead=config.nhead,
+            n_layers=config.n_layers,
+            gamma=config.gamma,
+            expectile_tau=config.expectile_tau,
+            beta_advantage=config.beta_advantage,
+            awr_weight_clip=config.awr_weight_clip,
+            polyak_tau=config.polyak_tau,
+            lr=config.lr,
+            weight_decay=config.weight_decay,
+            n_atoms=config.n_atoms,
+            hl_gauss_min=config.hl_gauss_min,
+            hl_gauss_max=config.hl_gauss_max,
+            hl_gauss_sigma=config.hl_gauss_sigma,
+            reward_scale=config.reward_scale,
+            max_grad_norm=config.max_grad_norm,
+            device=config.device,
+        )
+        agent = IQLAgent(iql_cfg)
+    elif tier2a:
         agent = SACAgentTier2a(
             device=config.device,
             n_prices=config.n_prices,
@@ -123,7 +155,10 @@ def evaluate(checkpoint_path: str, config: Stage1Config = None, verbose: bool = 
         done         = False
 
         while not done:
-            if tier2a:
+            if tier2c:
+                idx = agent.select_action(obs, deterministic=True)
+                action = TIER2A_IDX_TO_ENV_ACTION[idx].copy()
+            elif tier2a:
                 action, _idx = agent.select_action(obs, deterministic=True)
             else:
                 action = agent.select_action(obs, deterministic=True)
@@ -219,9 +254,16 @@ if __name__ == "__main__":
         "--tier2a", action="store_true",
         help="Use Stage1Tier2aConfig (discrete N=7 categorical actions atop Tier 1 stack)",
     )
+    parser.add_argument(
+        "--tier2c", action="store_true",
+        help="Use Stage1Tier2cConfig (offline IQL on MILP expert trajectories, "
+             "7-atom action lattice, IQLAgent checkpoint format)",
+    )
     args = parser.parse_args()
 
-    if args.tier2a:
+    if args.tier2c:
+        cfg = Stage1Tier2cConfig()
+    elif args.tier2a:
         cfg = Stage1Tier2aConfig()
     elif args.tier1:
         cfg = Stage1Tier1Config()

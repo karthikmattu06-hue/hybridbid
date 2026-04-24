@@ -356,3 +356,14 @@ class IQLAgent:
         self.critic_optim.load_state_dict(sd["critic_optim"])
         self.value_optim.load_state_dict(sd["value_optim"])
         self.ttfe_optim.load_state_dict(sd["ttfe_optim"])
+
+    def load_checkpoint(self, path: str) -> None:
+        """
+        Load a checkpoint saved by train_iql.py:
+            {"agent": agent.state_dict(), "step": int, "cfg": dict}
+
+        Matches the interface of SACAgent.load_checkpoint for parity with the
+        locked evaluation harness (src/evaluation/evaluate_stage1.py).
+        """
+        sd = torch.load(path, map_location=self.device, weights_only=False)
+        self.load_state_dict(sd["agent"])

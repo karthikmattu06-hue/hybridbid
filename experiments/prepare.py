@@ -28,6 +28,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.evaluation.evaluate_stage1 import evaluate
 from src.training.config import (
     Stage1Config, Stage1V60Config, Stage1Tier1Config, Stage1Tier2aConfig,
+    Stage1Tier2cConfig,
 )
 
 # ── Fixed constants — never change these ──
@@ -123,10 +124,16 @@ if __name__ == "__main__":
         "--tier2a", action="store_true",
         help="Use Stage1Tier2aConfig (discrete N=7 categorical actions atop Tier 1 stack)",
     )
+    parser.add_argument(
+        "--tier2c", action="store_true",
+        help="Use Stage1Tier2cConfig (offline IQL on MILP expert trajectories)",
+    )
     parser.add_argument("--device", default=None, help="Override compute device")
     args = parser.parse_args()
 
-    if args.tier2a:
+    if args.tier2c:
+        cfg = Stage1Tier2cConfig()
+    elif args.tier2a:
         cfg = Stage1Tier2aConfig()
     elif args.tier1:
         cfg = Stage1Tier1Config()
