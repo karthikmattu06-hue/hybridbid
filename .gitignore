@@ -39,3 +39,8 @@ build/
 # Gurobi
 gurobi.lic
 data/expert_trajectories/
+
+# ERCOT disclosure raw archives (too large for git)
+data/ercot_disclosure/sced/
+data/ercot_disclosure/dam/
+data/ercot_disclosure/_cache/
