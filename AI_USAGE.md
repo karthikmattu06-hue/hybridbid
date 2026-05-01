@@ -59,8 +59,9 @@ These entries cover Claude.ai conversations that shaped what code got written.
 
 - **Tool:** Claude.ai
 - **Request:** Adapt TempDRL (SAC + TTFE) to ERCOT's post-RTC+B market break, designing a pretrain→finetune system that retains pre-RTC+B knowledge while adapting to the new joint-clearing structure.
-- **Generated:** Two-stage design — Stage 1 energy-only pretrain (1D action space, replay buffer 1M, batch size 256); Stage 2 fine-tune with 6D action space (replay buffer 30–50k, batch size 128); progressive TTFE unfreezing at 10× lower LR per ULMFiT; fresh critic re-initialization; partial actor initialization (energy from Stage 1, AS dimensions near-zero). Each decision translated into code structure (separate config files per stage, weight-loading utilities, frozen-layer parameter groups).
-- **Modifications:** Refined as Stage 1 instability emerged. When the project pivoted to offline RL on post-RTC+B data, the existing structure (separate Stage 2 entry point, MILP demonstration data loader) made the pivot a matter of swapping training scripts rather than rewriting.
+- **Generated:** Claude.ai returned analysis of how a two-stage approach could work, describing the general structure and tradeoffs.
+- **Design decisions (ours):** Two-stage design — Stage 1 energy-only pretrain (1D action space, replay buffer 1M, batch size 256); Stage 2 fine-tune with 6D action space (replay buffer 30–50k, batch size 128); progressive TTFE unfreezing at 10× lower LR per ULMFiT; fresh critic re-initialization; partial actor initialization (energy from Stage 1, AS dimensions near-zero). Each decision about hyperparameters, initialization strategy, and code structure (separate config files per stage, weight-loading utilities, frozen-layer parameter groups) was made and validated by us.
+- **Modifications:** I refined the design as Stage 1 instability emerged. When I pivoted the project to offline RL on post-RTC+B data, the structure I had built (separate Stage 2 entry point, MILP demonstration data loader) made the pivot a matter of swapping training scripts rather than rewriting.
 - **Learned:** Designing for the possibility of a pivot before knowing whether one would happen kept the codebase flexible at low cost.
 
 ### 8. Paper-Spec Reset (v5)
